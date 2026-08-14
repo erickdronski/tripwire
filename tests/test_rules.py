@@ -434,3 +434,30 @@ class TestWindowsPathHandling(unittest.TestCase):
             inventory, _ = fixture.audit()
         for script in inventory.skills[0].scripts:
             self.assertNotIn("\\", script, "a backslash leaked into reported output")
+
+    def test_documentation_is_never_reported_as_executable_code(self):
+        """SKILL.md is the skill definition, not a bundled script.
+
+        On Windows `os.access(path, os.X_OK)` is true for every file, so the
+        skill's own SKILL.md was reported as executable code — a false positive
+        on every skill, on one platform. Extension exclusion makes the answer
+        the same everywhere.
+        """
+        with ConfigFixture() as fixture:
+            fixture.skill("s", "body", plugin=True)
+            inventory, findings = fixture.audit()
+        self.assertEqual(
+            inventory.skills[0].scripts, [], "documentation counted as a script"
+        )
+        self.assertFalse(
+            [f for f in findings if f.rule == "skill.bundled-scripts"],
+            "a skill with no scripts was reported as shipping code",
+        )
+
+    def test_real_scripts_are_still_found_alongside_documentation(self):
+        with ConfigFixture() as fixture:
+            fixture.skill(
+                "s", "body", scripts=["scripts/run.sh", "notes.md"], plugin=True
+            )
+            inventory, _ = fixture.audit()
+        self.assertEqual(inventory.skills[0].scripts, ["scripts/run.sh"])

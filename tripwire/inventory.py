@@ -329,6 +329,31 @@ def _classify_skill_source(path: str) -> str:
     return "user"
 
 
+#: Extensions that make a bundled file executable code regardless of platform.
+_SCRIPT_EXTENSIONS = (
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".py",
+    ".js",
+    ".mjs",
+    ".rb",
+    ".pl",
+    ".ps1",
+)
+
+#: Documentation and data that ship alongside a skill. These are never
+#: "executable code" no matter what the filesystem claims about them.
+_NEVER_A_SCRIPT = (".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".csv")
+
+#: The executable bit only means something on POSIX. On Windows
+#: ``os.access(path, os.X_OK)`` is true for *every* existing file, so trusting
+#: it there reported each skill's own SKILL.md as bundled executable code — a
+#: false positive on every skill, on one platform, in the exact tool whose
+#: whole design premise is not crying wolf.
+_EXECUTABLE_BIT_IS_MEANINGFUL = os.name != "nt"
+
+
 def _find_scripts(directory: str) -> List[str]:
     """Executable or script-extension files bundled with a skill."""
     out: List[str] = []
@@ -336,10 +361,13 @@ def _find_scripts(directory: str) -> List[str]:
         dirnames[:] = [d for d in dirnames if d not in ("node_modules", ".git")]
         for filename in filenames:
             full = os.path.join(dirpath, filename)
-            if filename.endswith(
-                (".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".rb", ".pl", ".ps1")
-            ):
+            lowered = filename.lower()
+            if lowered.endswith(_NEVER_A_SCRIPT):
+                continue
+            if lowered.endswith(_SCRIPT_EXTENSIONS):
                 out.append(_posix(os.path.relpath(full, directory)))
+                continue
+            if not _EXECUTABLE_BIT_IS_MEANINGFUL:
                 continue
             try:
                 if os.access(full, os.X_OK) and not os.path.isdir(full):

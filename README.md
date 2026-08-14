@@ -17,7 +17,7 @@ An offline audit of the skills, MCP servers, hooks, and permissions installed on
   <img alt="Python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-174ea6">
   <img alt="Linux macOS Windows" src="https://img.shields.io/badge/tested_on-Linux%20%7C%20macOS%20%7C%20Windows-0f766e">
   <img alt="ruff" src="https://img.shields.io/badge/lint-ruff-d97706">
-  <img alt="46 tests" src="https://img.shields.io/badge/tests-59-6b21a8">
+  <img alt="46 tests" src="https://img.shields.io/badge/tests-83-6b21a8">
 </p>
 
 ---
@@ -144,6 +144,50 @@ tripwire --info            # include the full capability inventory
 tripwire --project .       # also audit project-local .claude/ and .mcp.json
 ```
 
+## Living with it: suppression and baselines
+
+A scanner with no way to say "I reviewed this and it's fine" gets one run and
+then gets deleted. Two mechanisms, deliberately distinct:
+
+**`.tripwireignore`** — a permanent, reviewed decision.
+
+```
+# rule                    path (or *)   reason
+settings.wildcard-allow   *             reviewed: this box is a disposable container
+skill.bundled-scripts     plugins/mine  I wrote these
+```
+
+**`--baseline`** — answers the question security work actually turns on: *what
+changed?*
+
+```bash
+tripwire --update-baseline      # record today's findings as reviewed
+tripwire --baseline             # later: mark anything absent from it as NEW
+tripwire --baseline --new-only  # just the new ones
+```
+
+```
+  1 high · 1 medium · 0 low · 1 informational
+  1 new since the baseline · 2 already known
+  1 finding(s) suppressed by .tripwireignore
+
+  HIGH
+
+  !! NEW  Approval prompts are disabled
+```
+
+Two properties make this safe to rely on:
+
+- **A suppression is always counted in the output.** A suppression you cannot
+  see is indistinguishable from a scanner that missed something.
+- **With a baseline, only *new* findings gate CI.** Failing on known ones keeps
+  the build red until every historical finding is resolved, which is how a
+  security gate gets switched off.
+
+```bash
+tripwire --baseline --fail-on high   # breaks the build only on something new
+```
+
 ## What it does not do
 
 Being honest about this is the difference between a useful tool and security
@@ -176,7 +220,7 @@ right now?*
 ## Testing
 
 ```bash
-python -m unittest discover -s tests -t .   # 59 tests
+python -m unittest discover -s tests -t .   # 83 tests
 ```
 
 ## Related

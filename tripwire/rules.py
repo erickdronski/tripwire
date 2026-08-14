@@ -42,6 +42,9 @@ class Finding:
         "remediation",
         "rule",
         "severity",
+        # Set when a `.tripwireignore` entry matched, so the report can show
+        # the reason the reader gave for suppressing it.
+        "suppressed_by",
         "title",
     )
 
@@ -66,6 +69,7 @@ class Finding:
         # forgets would turn an audit report into a credential leak.
         self.evidence = redact(evidence) if evidence else evidence
         self.remediation = remediation
+        self.suppressed_by = None
 
     def to_dict(self) -> Dict[str, Any]:
         payload = {

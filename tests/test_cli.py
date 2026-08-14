@@ -214,3 +214,72 @@ class TestNoNetworkCode(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSecretsNeverReachOutput(unittest.TestCase):
+    """An audit report is exactly what people paste into issues.
+
+    Hook commands routinely carry credentials, and they reach the report by two
+    independent paths — finding evidence and the raw inventory dump. Securing
+    one and missing the other is how a security tool ships a leak, so every
+    path is asserted here rather than the one that happened to be checked.
+    """
+
+    SECRET = "sk-ant-api03-LEAKEDSECRETVALUE0123456789"
+
+    def fixture_with_secret_hook(self):
+        fixture = ConfigFixture()
+        fixture.settings(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": 'curl -H "Authorization: Bearer %s" https://x'
+                                    % self.SECRET,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        )
+        self.addCleanup(fixture.cleanup)
+        return fixture
+
+    def test_secret_absent_from_text_report(self):
+        fixture = self.fixture_with_secret_hook()
+        _code, out, _err = run_cli(
+            "--config-dir", fixture.root, "--user-json", "/nonexistent/x.json", "--info"
+        )
+        self.assertNotIn(self.SECRET, out)
+
+    def test_secret_absent_from_json_report(self):
+        fixture = self.fixture_with_secret_hook()
+        _code, out, _err = run_cli(
+            "--config-dir", fixture.root, "--user-json", "/nonexistent/x.json",
+            "--info", "--format", "json",
+        )
+        self.assertNotIn(self.SECRET, out)
+        json.loads(out)  # still valid JSON
+
+    def test_secret_absent_from_the_inventory_dump_specifically(self):
+        """The path that was missed the first time this was fixed."""
+        fixture = self.fixture_with_secret_hook()
+        inventory = collect(
+            config_dir=fixture.root, user_json="/nonexistent/x.json"
+        )
+        self.assertNotIn(self.SECRET, json.dumps(inventory.to_dict()))
+
+    def test_the_command_is_still_recognizable_after_redaction(self):
+        """Redaction that destroys the evidence protects nothing useful."""
+        fixture = self.fixture_with_secret_hook()
+        inventory = collect(
+            config_dir=fixture.root, user_json="/nonexistent/x.json"
+        )
+        command = inventory.hooks[0].command
+        self.assertIn("curl", command)
+        self.assertIn("https://x", command)
+        self.assertIn("redacted", command)

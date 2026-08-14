@@ -33,6 +33,8 @@ import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from .redact import redact
+
 __all__ = [
     "Skill",
     "Server",
@@ -160,7 +162,10 @@ class Hook:
     ) -> None:
         self.event = event
         self.matcher = matcher
-        self.command = command
+        # Redact at capture, not at render. A hook command reaches the report
+        # through two paths — finding evidence and the inventory dump — and
+        # securing one while missing the other is how leaks ship.
+        self.command = redact(command)
         self.source = source
         self.timeout = timeout
         self.kind = kind

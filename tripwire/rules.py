@@ -28,6 +28,7 @@ import unicodedata
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .inventory import Hook, Inventory, Server, Skill
+from .redact import redact
 
 __all__ = ["Finding", "run_all", "SEVERITIES"]
 
@@ -63,7 +64,9 @@ class Finding:
         self.detail = detail
         self.mechanism = mechanism
         self.location = location
-        self.evidence = evidence
+        # Redact centrally rather than at each call site: a rule author who
+        # forgets would turn an audit report into a credential leak.
+        self.evidence = redact(evidence) if evidence else evidence
         self.remediation = remediation
 
     def to_dict(self) -> Dict[str, Any]:

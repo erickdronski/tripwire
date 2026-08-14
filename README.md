@@ -15,7 +15,7 @@ An offline audit of the skills, MCP servers, hooks, and permissions installed on
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-101828">
   <img alt="zero dependencies" src="https://img.shields.io/badge/dependencies-0-08775c">
   <img alt="Python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-174ea6">
-  <img alt="46 tests" src="https://img.shields.io/badge/tests-46-6b21a8">
+  <img alt="46 tests" src="https://img.shields.io/badge/tests-50-6b21a8">
 </p>
 
 ---
@@ -157,6 +157,12 @@ theater.
   and a skill that steals them look similar from the outside. That is why every
   finding states its mechanism and asks you to read the file, rather than
   declaring a verdict.
+- **It masks credentials in its own output, best-effort.** Hook commands
+  routinely carry tokens, and an audit report is exactly what people paste into
+  issues. Evidence is redacted at capture, so both the text report and the raw
+  inventory dump are covered — there is a regression test for each, because the
+  first fix secured one path and missed the other. A secret with no
+  recognizable shape can still pass through.
 - **It makes no network calls at all** — no telemetry, no reputation lookup, no
   update check. There is a test asserting the package imports no networking or
   subprocess module, so the claim stays true.
@@ -168,7 +174,7 @@ right now?*
 ## Testing
 
 ```bash
-python -m unittest discover -s tests -t .   # 46 tests
+python -m unittest discover -s tests -t .   # 50 tests
 ```
 
 ## Related

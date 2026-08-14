@@ -30,9 +30,12 @@ specific ways it can be turned against you.
 ## Try it
 
 ```bash
-pip install tripwire-agent
+pip install git+https://github.com/erickdronski/tripwire
 tripwire
 ```
+
+Installing from git is the supported path today — this is not on PyPI yet. When
+it is published the distribution name will be `tripwire-agent`.
 
 ```
 ────────────────────────────────────────────────────────────────────────

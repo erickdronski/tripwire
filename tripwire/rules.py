@@ -22,29 +22,27 @@ checks are string and structure inspection on files already on disk.
 
 from __future__ import annotations
 
-import os
 import re
-import unicodedata
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
-from .inventory import Hook, Inventory, Server, Skill
+from .inventory import Inventory
 from .redact import redact
 
-__all__ = ["Finding", "run_all", "SEVERITIES"]
+__all__ = ["SEVERITIES", "Finding", "run_all"]
 
 SEVERITIES = ("high", "medium", "low", "info")
 
 
 class Finding:
     __slots__ = (
+        "detail",
+        "evidence",
+        "location",
+        "mechanism",
+        "remediation",
         "rule",
         "severity",
         "title",
-        "detail",
-        "mechanism",
-        "location",
-        "evidence",
-        "remediation",
     )
 
     def __init__(
@@ -103,23 +101,44 @@ class Finding:
 #: documentation use: overriding prior instructions, hiding activity from the
 #: user, or shipping data to a fixed endpoint.
 _IMPERATIVE_PATTERNS = (
-    (r"ignore (all |any )?(previous|prior|earlier|above) (instructions|prompts|rules)",
-     "override of prior instructions", "high"),
-    (r"disregard (all |any )?(previous|prior|the above) (instructions|prompts|rules)",
-     "override of prior instructions", "high"),
-    (r"do not (tell|inform|mention to|reveal to) the user",
-     "concealment from the user", "high"),
-    (r"without (telling|informing|notifying) the user",
-     "concealment from the user", "high"),
-    (r"never (mention|reveal|disclose) (this|these|the) (instruction|prompt|file|skill)",
-     "concealment of its own contents", "high"),
+    (
+        r"ignore (all |any )?(previous|prior|earlier|above) (instructions|prompts|rules)",
+        "override of prior instructions",
+        "high",
+    ),
+    (
+        r"disregard (all |any )?(previous|prior|the above) (instructions|prompts|rules)",
+        "override of prior instructions",
+        "high",
+    ),
+    (
+        r"do not (tell|inform|mention to|reveal to) the user",
+        "concealment from the user",
+        "high",
+    ),
+    (
+        r"without (telling|informing|notifying) the user",
+        "concealment from the user",
+        "high",
+    ),
+    (
+        r"never (mention|reveal|disclose) (this|these|the) (instruction|prompt|file|skill)",
+        "concealment of its own contents",
+        "high",
+    ),
     (r"new (system )?(instructions|prompt)\s*:", "injected system prompt", "high"),
-    (r"(send|post|upload|exfiltrate|transmit) .{0,40}(to|at) https?://",
-     "outbound transmission to a fixed endpoint", "high"),
+    (
+        r"(send|post|upload|exfiltrate|transmit) .{0,40}(to|at) https?://",
+        "outbound transmission to a fixed endpoint",
+        "high",
+    ),
     (r"you are now\b", "identity override", "medium"),
     (r"\b(curl|wget)\b.{0,60}\|\s*(ba|z)?sh", "pipe-to-shell execution", "medium"),
-    (r"(cat|read|print|open).{0,30}(\.env\b|id_rsa|\.aws/|\.ssh/|credentials\b)",
-     "reads a credential file", "low"),
+    (
+        r"(cat|read|print|open).{0,30}(\.env\b|id_rsa|\.aws/|\.ssh/|credentials\b)",
+        "reads a credential file",
+        "low",
+    ),
     (r"rm\s+-rf?\s+[~/]", "destructive filesystem command", "low"),
 )
 
@@ -143,7 +162,7 @@ _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 
 
 def _strip_code(text: str) -> str:
-    """Remove fenced blocks and inline code spans.
+    r"""Remove fenced blocks and inline code spans.
 
     Documentation quotes dangerous commands constantly — a hook-authoring
     skill showing ``rm\s+-rf`` as a regex example is not an attack, and a
@@ -257,9 +276,7 @@ def _scan_text_for_injection(
                             "worth reading before you trust the skill."
                         ),
                         location=location,
-                        evidence=_excerpt(
-                            prose, credential.start(), credential.end()
-                        ),
+                        evidence=_excerpt(prose, credential.start(), credential.end()),
                         remediation=(
                             "Read the whole section. Confirm the network call is "
                             "to the service the credential belongs to."
@@ -305,7 +322,11 @@ def _excerpt(text: str, start: int, end: int, window: int = 60) -> str:
     begin = max(0, start - window)
     finish = min(len(text), end + window)
     snippet = text[begin:finish].replace("\n", " ")
-    return ("..." if begin else "") + snippet.strip() + ("..." if finish < len(text) else "")
+    return (
+        ("..." if begin else "")
+        + snippet.strip()
+        + ("..." if finish < len(text) else "")
+    )
 
 
 # -- skills ---------------------------------------------------------------
@@ -316,9 +337,7 @@ def check_skills(inventory: Inventory) -> List[Finding]:
     for skill in inventory.skills:
         trusted = skill.source in ("user", "project")
         findings.extend(
-            _scan_text_for_injection(
-                skill.text, skill.path, "skill", trusted=trusted
-            )
+            _scan_text_for_injection(skill.text, skill.path, "skill", trusted=trusted)
         )
 
         if skill.scripts:
@@ -394,9 +413,7 @@ def check_servers(inventory: Inventory) -> List[Finding]:
                     detail=(
                         "The command fetches and runs a package every time the "
                         "server starts%s."
-                        % (
-                            ", pinned to a version" if pinned else ", unpinned"
-                        )
+                        % (", pinned to a version" if pinned else ", unpinned")
                     ),
                     mechanism=(
                         "An unpinned auto-installing command runs whatever the "
@@ -490,7 +507,8 @@ def check_hooks(inventory: Inventory) -> List[Finding]:
     findings: List[Finding] = []
     for hook in inventory.hooks:
         matched = [
-            label for pattern, label in _DANGEROUS_COMMAND_RE
+            label
+            for pattern, label in _DANGEROUS_COMMAND_RE
             if pattern.search(hook.command)
         ]
 
@@ -516,8 +534,7 @@ def check_hooks(inventory: Inventory) -> List[Finding]:
                 location=hook.source,
                 evidence=_one_line(hook.command),
                 remediation=(
-                    "Confirm you wrote this and that it still does what you "
-                    "intended."
+                    "Confirm you wrote this and that it still does what you intended."
                 ),
             )
         )
@@ -570,7 +587,8 @@ def check_settings(inventory: Inventory) -> List[Finding]:
             allow = permissions.get("allow")
             if isinstance(allow, list):
                 wildcards = [
-                    entry for entry in allow
+                    entry
+                    for entry in allow
                     if isinstance(entry, str) and _WILDCARD_RE.match(entry.strip())
                 ]
                 if wildcards:
@@ -623,7 +641,6 @@ def summarize_capabilities(inventory: Inventory) -> Dict[str, Any]:
     This is the part people actually act on. Not a list of problems — a plain
     statement of reach.
     """
-    shell_capable = [h for h in inventory.hooks]
     third_party_skills = [
         s for s in inventory.skills if s.source not in ("user", "project")
     ]

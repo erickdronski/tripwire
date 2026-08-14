@@ -10,12 +10,12 @@ severity first, each with the mechanism attached — a scanner that says
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Dict, List, Sequence
 
 from .inventory import Inventory
-from .rules import Finding, SEVERITIES, summarize_capabilities
+from .rules import SEVERITIES, Finding, summarize_capabilities
 
-__all__ = ["render_text", "render_json"]
+__all__ = ["render_json", "render_text"]
 
 _MARK = {"high": "!!", "medium": " !", "low": " ·", "info": " ·"}
 
@@ -51,7 +51,7 @@ def render_text(
         lines.append("  %-34s %d" % ("unreadable files (skipped)", caps["unreadable"]))
     lines.append("")
 
-    counts = {level: 0 for level in SEVERITIES}
+    counts = dict.fromkeys(SEVERITIES, 0)
     for finding in findings:
         counts[finding.severity] = counts.get(finding.severity, 0) + 1
 
@@ -89,20 +89,14 @@ def render_text(
         lines.append("")
 
     lines.append(rule)
-    lines.append(
-        "  This is a static read of local config. It proves nothing is"
-    )
-    lines.append(
-        "  obviously wrong, not that nothing is wrong."
-    )
+    lines.append("  This is a static read of local config. It proves nothing is")
+    lines.append("  obviously wrong, not that nothing is wrong.")
     lines.append("")
     return "\n".join(lines)
 
 
-def render_json(
-    inventory: Inventory, findings: Sequence[Finding], version: str
-) -> str:
-    counts: Dict[str, int] = {level: 0 for level in SEVERITIES}
+def render_json(inventory: Inventory, findings: Sequence[Finding], version: str) -> str:
+    counts: Dict[str, int] = dict.fromkeys(SEVERITIES, 0)
     for finding in findings:
         counts[finding.severity] = counts.get(finding.severity, 0) + 1
     return json.dumps(

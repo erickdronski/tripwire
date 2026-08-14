@@ -30,19 +30,18 @@ from __future__ import annotations
 
 import json
 import os
-import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from .redact import redact
 
 __all__ = [
-    "Skill",
-    "Server",
     "Hook",
-    "SettingsFile",
     "Inventory",
-    "collect",
     "InventoryError",
+    "Server",
+    "SettingsFile",
+    "Skill",
+    "collect",
 ]
 
 
@@ -66,13 +65,13 @@ MAX_READ_BYTES = 400_000
 
 class Skill:
     __slots__ = (
+        "body",
+        "description",
+        "frontmatter",
         "name",
         "path",
-        "source",
-        "description",
-        "body",
         "scripts",
-        "frontmatter",
+        "source",
     )
 
     def __init__(
@@ -109,7 +108,7 @@ class Skill:
 
 
 class Server:
-    __slots__ = ("name", "source", "command", "args", "env", "url", "raw", "scope")
+    __slots__ = ("args", "command", "env", "name", "raw", "scope", "source", "url")
 
     def __init__(
         self,
@@ -135,7 +134,7 @@ class Server:
     def command_line(self) -> str:
         if self.url:
             return self.url
-        parts = [self.command or ""] + self.args
+        parts = [self.command or "", *self.args]
         return " ".join(part for part in parts if part).strip()
 
     def to_dict(self) -> Dict[str, Any]:
@@ -149,7 +148,7 @@ class Server:
 
 
 class Hook:
-    __slots__ = ("event", "matcher", "command", "source", "timeout", "kind")
+    __slots__ = ("command", "event", "kind", "matcher", "source", "timeout")
 
     def __init__(
         self,
@@ -181,7 +180,7 @@ class Hook:
 
 
 class SettingsFile:
-    __slots__ = ("path", "data", "scope")
+    __slots__ = ("data", "path", "scope")
 
     def __init__(self, path: str, data: Dict[str, Any], scope: str) -> None:
         self.path = path
@@ -427,7 +426,9 @@ def _collect_user_json(inventory: Inventory, path: str) -> None:
             project_servers = config.get("mcpServers")
             if isinstance(project_servers, dict):
                 _absorb_servers(
-                    inventory, project_servers, "%s (%s)" % (path, project_path),
+                    inventory,
+                    project_servers,
+                    "%s (%s)" % (path, project_path),
                     "project",
                 )
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from typing import List, Pattern, Tuple
 
-__all__ = ["redact", "redact_all", "PATTERNS"]
+__all__ = ["PATTERNS", "redact", "redact_all"]
 
 
 def _mask(value: str, keep: int = 3) -> str:
@@ -51,15 +51,23 @@ PATTERNS: Tuple[Tuple[Pattern, int], ...] = (
     (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), 0),
     # Credentials embedded in a URL: postgres://user:pass@host, https://u:p@h
     (
-        re.compile(
-            r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/@'\"]+:)([^\s@'\"]{3,})(@)"
-        ),
+        re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/@'\"]+:)([^\s@'\"]{3,})(@)"),
         2,
     ),
     # Private key blocks.
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), 0),
+    (
+        re.compile(
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+        ),
+        0,
+    ),
     # Authorization headers, in any of the shapes a shell line takes.
-    (re.compile(r"(?i)(authorization\s*:\s*(?:bearer|basic|token)\s+)([^\s\"']{8,})"), 2),
+    (
+        re.compile(
+            r"(?i)(authorization\s*:\s*(?:bearer|basic|token)\s+)([^\s\"']{8,})"
+        ),
+        2,
+    ),
     # Assignments to secret-sounding names: KEY=..., --token=..., "password": "..."
     (
         re.compile(
@@ -83,12 +91,28 @@ PATTERNS: Tuple[Tuple[Pattern, int], ...] = (
 #: would make the output worse for no gain.
 _SAFE_VALUES = frozenset(
     {
-        "true", "false", "null", "none", "nil", "yes", "no", "0", "1",
-        "changeme", "example", "placeholder", "test", "dummy", "redacted",
+        "true",
+        "false",
+        "null",
+        "none",
+        "nil",
+        "yes",
+        "no",
+        "0",
+        "1",
+        "changeme",
+        "example",
+        "placeholder",
+        "test",
+        "dummy",
+        "redacted",
         # Auth *scheme* words. `Authorization: Bearer $TOKEN` otherwise trips
         # the assignment rule — "Authorization" contains AUTH — and masks the
         # scheme instead of the value, which hides nothing and looks broken.
-        "bearer", "basic", "digest", "token",
+        "bearer",
+        "basic",
+        "digest",
+        "token",
     }
 )
 
@@ -108,6 +132,7 @@ def redact(text: str) -> str:
 
     result = text
     for pattern, group in PATTERNS:
+
         def replace(match, _group=group):
             if _group == 0:
                 return _mask(match.group(0))
@@ -117,7 +142,7 @@ def redact(text: str) -> str:
             if _REFERENCE.match(value.strip()) or value.strip().lower() in _SAFE_VALUES:
                 return match.group(0)
             prefix = match.group(0)[: match.start(_group) - match.start(0)]
-            suffix = match.group(0)[match.end(_group) - match.start(0):]
+            suffix = match.group(0)[match.end(_group) - match.start(0) :]
             return prefix + _mask(value) + suffix
 
         result = pattern.sub(replace, result)

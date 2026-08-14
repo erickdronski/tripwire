@@ -50,16 +50,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--info", action="store_true", help="include informational findings"
     )
-    parser.add_argument(
-        "--format", choices=("text", "json"), default="text"
-    )
+    parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument(
         "--fail-on",
-        choices=SEVERITIES + ("never",),
+        choices=(*SEVERITIES, "never"),
         default="never",
         help="exit 1 when a finding at or above this severity exists",
     )
-    parser.add_argument("--version", action="version", version="tripwire %s" % __version__)
+    parser.add_argument(
+        "--version", action="version", version="tripwire %s" % __version__
+    )
     return parser
 
 
@@ -84,9 +84,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.format == "json":
         sys.stdout.write(render_json(inventory, findings, __version__) + "\n")
     else:
-        sys.stdout.write(
-            render_text(inventory, findings, show_info=args.info) + "\n"
-        )
+        sys.stdout.write(render_text(inventory, findings, show_info=args.info) + "\n")
 
     if args.fail_on != "never":
         threshold = SEVERITIES.index(args.fail_on)

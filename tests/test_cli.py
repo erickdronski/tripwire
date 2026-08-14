@@ -28,7 +28,11 @@ class TestInventory(unittest.TestCase):
             fixture.settings(
                 {
                     "mcpServers": {"s": {"command": "node", "args": ["x.js"]}},
-                    "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}]},
+                    "hooks": {
+                        "SessionStart": [
+                            {"hooks": [{"type": "command", "command": "true"}]}
+                        ]
+                    },
                 }
             )
             inventory = collect(
@@ -106,12 +110,22 @@ class TestReport(unittest.TestCase):
     def test_info_findings_hidden_by_default(self):
         with ConfigFixture() as fixture:
             fixture.settings(
-                {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}]}}
+                {
+                    "hooks": {
+                        "SessionStart": [
+                            {"hooks": [{"type": "command", "command": "true"}]}
+                        ]
+                    }
+                }
             )
-            inventory = collect(config_dir=fixture.root, user_json="/nonexistent/x.json")
+            inventory = collect(
+                config_dir=fixture.root, user_json="/nonexistent/x.json"
+            )
             findings = run_all(inventory)
         self.assertNotIn("Automatic command", render_text(inventory, findings))
-        self.assertIn("Automatic command", render_text(inventory, findings, show_info=True))
+        self.assertIn(
+            "Automatic command", render_text(inventory, findings, show_info=True)
+        )
 
     def test_home_directory_is_shortened(self):
         inventory, findings = self.build()
@@ -129,7 +143,9 @@ class TestReport(unittest.TestCase):
     def test_clean_config_says_so(self):
         with ConfigFixture() as fixture:
             fixture.skill("a", "An ordinary skill that formats code.", plugin=True)
-            inventory = collect(config_dir=fixture.root, user_json="/nonexistent/x.json")
+            inventory = collect(
+                config_dir=fixture.root, user_json="/nonexistent/x.json"
+            )
             findings = run_all(inventory)
         self.assertIn("Nothing to flag", render_text(inventory, findings))
 
@@ -147,9 +163,13 @@ class TestCLI(unittest.TestCase):
     def test_json_output(self):
         with ConfigFixture() as fixture:
             fixture.settings({"dangerouslySkipPermissions": True})
-            code, out, _ = run_cli(
-                "--config-dir", fixture.root, "--user-json", "/nonexistent/x.json",
-                "--format", "json",
+            _code, out, _ = run_cli(
+                "--config-dir",
+                fixture.root,
+                "--user-json",
+                "/nonexistent/x.json",
+                "--format",
+                "json",
             )
         payload = json.loads(out)
         self.assertEqual(payload["tool"], "tripwire")
@@ -158,8 +178,12 @@ class TestCLI(unittest.TestCase):
         with ConfigFixture() as fixture:
             fixture.settings({"dangerouslySkipPermissions": True})
             code, _, _ = run_cli(
-                "--config-dir", fixture.root, "--user-json", "/nonexistent/x.json",
-                "--fail-on", "high",
+                "--config-dir",
+                fixture.root,
+                "--user-json",
+                "/nonexistent/x.json",
+                "--fail-on",
+                "high",
             )
         self.assertEqual(code, 1)
 
@@ -167,8 +191,12 @@ class TestCLI(unittest.TestCase):
         with ConfigFixture() as fixture:
             fixture.settings({"permissions": {"allow": ["Bash(*)"]}})
             code, _, _ = run_cli(
-                "--config-dir", fixture.root, "--user-json", "/nonexistent/x.json",
-                "--fail-on", "high",
+                "--config-dir",
+                fixture.root,
+                "--user-json",
+                "/nonexistent/x.json",
+                "--fail-on",
+                "high",
             )
         self.assertEqual(code, 0)
 
@@ -195,8 +223,16 @@ class TestNoNetworkCode(unittest.TestCase):
         import tripwire
 
         package_dir = os.path.dirname(os.path.abspath(tripwire.__file__))
-        banned = ("import socket", "import urllib", "import http", "import requests",
-                  "from socket", "from urllib", "from http", "subprocess")
+        banned = (
+            "import socket",
+            "import urllib",
+            "import http",
+            "import requests",
+            "from socket",
+            "from urllib",
+            "from http",
+            "subprocess",
+        )
         for filename in os.listdir(package_dir):
             if not filename.endswith(".py"):
                 continue
@@ -259,8 +295,13 @@ class TestSecretsNeverReachOutput(unittest.TestCase):
     def test_secret_absent_from_json_report(self):
         fixture = self.fixture_with_secret_hook()
         _code, out, _err = run_cli(
-            "--config-dir", fixture.root, "--user-json", "/nonexistent/x.json",
-            "--info", "--format", "json",
+            "--config-dir",
+            fixture.root,
+            "--user-json",
+            "/nonexistent/x.json",
+            "--info",
+            "--format",
+            "json",
         )
         self.assertNotIn(self.SECRET, out)
         json.loads(out)  # still valid JSON
@@ -268,17 +309,13 @@ class TestSecretsNeverReachOutput(unittest.TestCase):
     def test_secret_absent_from_the_inventory_dump_specifically(self):
         """The path that was missed the first time this was fixed."""
         fixture = self.fixture_with_secret_hook()
-        inventory = collect(
-            config_dir=fixture.root, user_json="/nonexistent/x.json"
-        )
+        inventory = collect(config_dir=fixture.root, user_json="/nonexistent/x.json")
         self.assertNotIn(self.SECRET, json.dumps(inventory.to_dict()))
 
     def test_the_command_is_still_recognizable_after_redaction(self):
         """Redaction that destroys the evidence protects nothing useful."""
         fixture = self.fixture_with_secret_hook()
-        inventory = collect(
-            config_dir=fixture.root, user_json="/nonexistent/x.json"
-        )
+        inventory = collect(config_dir=fixture.root, user_json="/nonexistent/x.json")
         command = inventory.hooks[0].command
         self.assertIn("curl", command)
         self.assertIn("https://x", command)

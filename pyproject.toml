@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tripwire-agent"
+version = "0.1.0"
+description = "See what your coding agent is actually allowed to do. Offline audit of installed skills, MCP servers, hooks, and permissions."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "Erick Dronski" }]
+keywords = ["claude-code", "mcp", "ai-agents", "security", "prompt-injection", "audit", "supply-chain", "cli"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/erickdronski/tripwire"
+Issues = "https://github.com/erickdronski/tripwire/issues"
+
+[project.scripts]
+tripwire = "tripwire.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tripwire*"]

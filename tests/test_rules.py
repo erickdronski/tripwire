@@ -388,3 +388,49 @@ class TestRobustness(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWindowsPathHandling(unittest.TestCase):
+    """Classification must not depend on the platform's path separator.
+
+    A real bug: `_classify_skill_source` tested for `"/plugins/marketplaces/"`,
+    which is never present in a Windows path. Every third-party skill was
+    therefore labelled locally authored and handed the trust discount that
+    downgrades its findings — a security tool silently under-reporting on one
+    platform. Found by the cross-platform CI matrix, pinned here so it stays
+    fixed on Linux too.
+    """
+
+    def test_backslash_path_is_classified_as_a_marketplace_skill(self):
+        from tripwire.inventory import _classify_skill_source
+
+        windows = r"C:\Users\x\.claude\plugins\marketplaces\official\plugins\p\skills\s\SKILL.md"
+        self.assertTrue(
+            _classify_skill_source(windows).startswith("marketplace:"),
+            "a Windows path was misread as locally authored",
+        )
+
+    def test_forward_slash_path_still_classified(self):
+        from tripwire.inventory import _classify_skill_source
+
+        posix = (
+            "/home/x/.claude/plugins/marketplaces/official/plugins/p/skills/s/SKILL.md"
+        )
+        self.assertTrue(_classify_skill_source(posix).startswith("marketplace:"))
+
+    def test_a_genuine_user_skill_is_still_user_on_either_separator(self):
+        from tripwire.inventory import _classify_skill_source
+
+        self.assertEqual(
+            _classify_skill_source(r"C:\Users\x\.claude\skills\mine\SKILL.md"), "user"
+        )
+        self.assertEqual(
+            _classify_skill_source("/home/x/.claude/skills/mine/SKILL.md"), "user"
+        )
+
+    def test_script_paths_are_reported_with_forward_slashes(self):
+        with ConfigFixture() as fixture:
+            fixture.skill("s", "body", scripts=["scripts/run.sh"], plugin=True)
+            inventory, _ = fixture.audit()
+        for script in inventory.skills[0].scripts:
+            self.assertNotIn("\\", script, "a backslash leaked into reported output")

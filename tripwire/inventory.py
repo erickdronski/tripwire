@@ -305,11 +305,26 @@ def _collect_skills(
         )
 
 
+def _posix(path: str) -> str:
+    """Normalize a filesystem path to forward slashes.
+
+    Every classification and comparison below is written against forward
+    slashes. On Windows `os.walk` yields backslashes, which silently broke
+    source classification: `"/plugins/marketplaces/" in path` was never true,
+    so third-party skills were labelled as locally authored and given the
+    trust discount that downgrades their findings. A security tool quietly
+    under-reporting on one platform is the worst kind of portability bug, so
+    normalization happens once, here, at the boundary.
+    """
+    return path.replace(os.sep, "/").replace("\\", "/")
+
+
 def _classify_skill_source(path: str) -> str:
-    if "/plugins/marketplaces/" in path:
-        parts = path.split("/plugins/marketplaces/", 1)[1].split("/")
+    normalized = _posix(path)
+    if "/plugins/marketplaces/" in normalized:
+        parts = normalized.split("/plugins/marketplaces/", 1)[1].split("/")
         return "marketplace:%s" % (parts[0] if parts else "unknown")
-    if "/plugins/" in path:
+    if "/plugins/" in normalized:
         return "plugin"
     return "user"
 
@@ -324,11 +339,11 @@ def _find_scripts(directory: str) -> List[str]:
             if filename.endswith(
                 (".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".rb", ".pl", ".ps1")
             ):
-                out.append(os.path.relpath(full, directory))
+                out.append(_posix(os.path.relpath(full, directory)))
                 continue
             try:
                 if os.access(full, os.X_OK) and not os.path.isdir(full):
-                    out.append(os.path.relpath(full, directory))
+                    out.append(_posix(os.path.relpath(full, directory)))
             except OSError:
                 continue
     return sorted(set(out))

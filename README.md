@@ -15,7 +15,9 @@ An offline audit of the skills, MCP servers, hooks, and permissions installed on
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-101828">
   <img alt="zero dependencies" src="https://img.shields.io/badge/dependencies-0-08775c">
   <img alt="Python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-174ea6">
-  <img alt="46 tests" src="https://img.shields.io/badge/tests-50-6b21a8">
+  <img alt="Linux macOS Windows" src="https://img.shields.io/badge/tested_on-Linux%20%7C%20macOS%20%7C%20Windows-0f766e">
+  <img alt="ruff" src="https://img.shields.io/badge/lint-ruff-d97706">
+  <img alt="46 tests" src="https://img.shields.io/badge/tests-59-6b21a8">
 </p>
 
 ---
@@ -174,7 +176,7 @@ right now?*
 ## Testing
 
 ```bash
-python -m unittest discover -s tests -t .   # 50 tests
+python -m unittest discover -s tests -t .   # 59 tests
 ```
 
 ## Related

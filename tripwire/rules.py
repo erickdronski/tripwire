@@ -22,6 +22,7 @@ checks are string and structure inspection on files already on disk.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -1005,12 +1006,25 @@ def _one_line(command: str, width: int = 150) -> str:
 
 _WILDCARD_RE = re.compile(r"^(Bash|Write|Edit|Read)\s*\(\s*\*?\s*\)$|^\*$")
 
+_APPROVAL_OFF = (
+    "Every tool call runs without asking — including commands an agent was "
+    "steered into by content it read from a web page, a file, or an installed "
+    "skill. This setting removes the last check between a prompt injection "
+    "and your shell."
+)
+
 
 def check_settings(inventory: Inventory) -> List[Finding]:
     findings: List[Finding] = []
     for settings in inventory.settings:
-        data = settings.data
+        if getattr(settings, "agent", "claude-code") == "codex":
+            if getattr(settings, "kind", "settings") == "app-state":
+                findings.extend(_check_codex_app(settings))
+            else:
+                findings.extend(_check_codex_config(settings))
+            continue
 
+        data = settings.data
         for flag, title in (
             ("dangerouslySkipPermissions", "Approval prompts are disabled"),
             ("bypassPermissions", "Approval prompts are bypassed"),
@@ -1022,13 +1036,7 @@ def check_settings(inventory: Inventory) -> List[Finding]:
                         severity="high",
                         title=title,
                         detail="`%s` is set to true." % flag,
-                        mechanism=(
-                            "Every tool call runs without asking — including "
-                            "commands an agent was steered into by content it "
-                            "read from a web page, a file, or an installed "
-                            "skill. This setting removes the last check between "
-                            "a prompt injection and your shell."
-                        ),
+                        mechanism=_APPROVAL_OFF,
                         location=settings.path,
                         remediation=(
                             "Remove the flag and use a scoped allow-list, or keep "
@@ -1038,6 +1046,40 @@ def check_settings(inventory: Inventory) -> List[Finding]:
                 )
 
         permissions = data.get("permissions")
+        mode = permissions.get("defaultMode") if isinstance(permissions, dict) else None
+        if mode == "bypassPermissions":
+            findings.append(
+                Finding(
+                    rule="settings.approval-disabled",
+                    severity="high",
+                    title="Approval prompts are bypassed by default",
+                    detail="`permissions.defaultMode` is `bypassPermissions`.",
+                    mechanism=_APPROVAL_OFF,
+                    location=settings.path,
+                    remediation=(
+                        "Use `default` or `acceptEdits` with a scoped allow-list, "
+                        "or keep bypass mode inside a disposable container."
+                    ),
+                )
+            )
+        elif mode == "acceptEdits":
+            findings.append(
+                Finding(
+                    rule="settings.accept-edits",
+                    severity="low",
+                    title="File edits are approved automatically",
+                    detail="`permissions.defaultMode` is `acceptEdits`.",
+                    mechanism=(
+                        "Edits are applied without asking. They are visible and "
+                        "reversible, which is why this is low — but an edit to a "
+                        "script, a hook, or a config that runs later is a "
+                        "command waiting to happen."
+                    ),
+                    location=settings.path,
+                    remediation="Keep it if you review diffs; otherwise use `default`.",
+                )
+            )
+
         if isinstance(permissions, dict):
             allow = permissions.get("allow")
             if isinstance(allow, list):
@@ -1084,6 +1126,209 @@ def check_settings(inventory: Inventory) -> List[Finding]:
                             remediation="Read it once and delete what you no longer need.",
                         )
                     )
+    return findings
+
+
+# -- Codex ------------------------------------------------------------------
+
+#: Codex's two independent checks. `approval_policy = "never"` removes the
+#: prompt; `sandbox_mode = "danger-full-access"` removes the sandbox. Either
+#: alone leaves the other standing. Both together are the equivalent of
+#: Claude Code's `dangerouslySkipPermissions`, and the only high case.
+_CODEX_KEYS = ("approval_policy", "sandbox_mode")
+_CODEX_NO_SANDBOX = "danger-full-access"
+#: Automation states that will not run until someone resumes them.
+_CODEX_STOPPED = ("PAUSED", "DISABLED", "ARCHIVED", "DELETED")
+_SEVERITY_CAP = {"high": "medium"}
+
+
+def _codex_mode(
+    conf: Dict[str, Any], path: str, subject: str, capped: bool
+) -> List[Finding]:
+    approval, sandbox = conf.get("approval_policy"), conf.get("sandbox_mode")
+    if approval == "never" and sandbox == _CODEX_NO_SANDBOX:
+        severity, rule = "high", "settings.approval-disabled"
+        title = "%s runs with no sandbox and no approval prompts" % subject
+        detail = (
+            '`approval_policy = "never"` and `sandbox_mode = "danger-full-access"`.'
+        )
+        mechanism = _APPROVAL_OFF + (
+            " Without the sandbox, nothing limits what that command can read, "
+            "write, or send."
+        )
+    elif sandbox == _CODEX_NO_SANDBOX:
+        severity, rule = "medium", "settings.sandbox-disabled"
+        title = "%s runs commands without a sandbox" % subject
+        detail = '`sandbox_mode = "danger-full-access"`; approval policy is %s.' % (
+            "`%s`" % approval if approval else "the default"
+        )
+        mechanism = (
+            "Commands run with your user's full filesystem and network access. "
+            "Only the approval policy stands between an injected instruction "
+            "and execution."
+        )
+    elif approval == "never":
+        severity, rule = "low", "settings.approval-disabled"
+        title = "%s never asks for approval" % subject
+        detail = '`approval_policy = "never"`; commands stay inside the %s sandbox.' % (
+            "`%s`" % sandbox if sandbox else "default"
+        )
+        mechanism = (
+            "Nothing is ever put to you, so the sandbox is the only check. It "
+            "still limits writes and network access, which is why this is low."
+        )
+    else:
+        return []
+    if capped:
+        severity = _SEVERITY_CAP.get(severity, severity)
+    return [
+        Finding(
+            rule=rule,
+            severity=severity,
+            title=title,
+            detail=detail,
+            mechanism=mechanism,
+            location=path,
+            remediation=(
+                "Keep the sandbox (`workspace-write`) and let Codex ask, or keep "
+                "full access for a disposable container."
+            ),
+        )
+    ]
+
+
+def _check_codex_config(settings) -> List[Finding]:
+    """``approval_policy`` / ``sandbox_mode``, at the top level and per profile.
+
+    The active profile (``profile = "name"``) overrides the top level and is
+    graded in full. Other profiles that loosen either setting are one flag
+    away (``codex --profile name``), so they are reported, capped at medium.
+    """
+    data = settings.data
+    top = {key: data.get(key) for key in _CODEX_KEYS}
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+    active = data.get("profile") if isinstance(data.get("profile"), str) else None
+
+    def merged(profile: Any) -> Dict[str, Any]:
+        result = dict(top)
+        if isinstance(profile, dict):
+            result.update(
+                {k: profile[k] for k in _CODEX_KEYS if profile.get(k) is not None}
+            )
+        return result
+
+    subject = "Codex (profile `%s`)" % active if active in profiles else "Codex"
+    findings = _codex_mode(merged(profiles.get(active)), settings.path, subject, False)
+    for name in sorted(profiles):
+        profile = profiles[name]
+        if name == active or not isinstance(profile, dict):
+            continue
+        if any(profile.get(key) is not None for key in _CODEX_KEYS):
+            findings.extend(
+                _codex_mode(
+                    merged(profile), settings.path, "Codex profile `%s`" % name, True
+                )
+            )
+
+    projects = data.get("projects")
+    trusted = sorted(
+        path
+        for path, conf in (projects.items() if isinstance(projects, dict) else [])
+        if isinstance(conf, dict) and conf.get("trust_level") == "trusted"
+    )
+    if trusted:
+        home = os.path.expanduser("~").rstrip("/\\")
+        broad = [p for p in trusted if p.rstrip("/\\") in ("", "~", home)]
+        findings.append(
+            Finding(
+                rule="settings.trusted-projects",
+                severity="medium" if broad else "info",
+                title=(
+                    "Codex trusts your entire home directory"
+                    if broad
+                    else "Codex trusts %d project director%s"
+                    % (len(trusted), "y" if len(trusted) == 1 else "ies")
+                ),
+                detail="Trusted: %s." % ", ".join(trusted[:5])
+                + (" and %d more" % (len(trusted) - 5) if len(trusted) > 5 else ""),
+                mechanism=(
+                    "A trusted directory gets Codex's less restrictive defaults "
+                    "without the first-run question. Trusting a parent trusts "
+                    "everything ever cloned beneath it."
+                ),
+                location=settings.path,
+                remediation="Trust individual projects rather than a parent directory.",
+            )
+        )
+    return findings
+
+
+def _check_codex_app(settings) -> List[Finding]:
+    """The Codex app's own permission mode, and its scheduled automations."""
+    data = settings.data
+    findings: List[Finding] = []
+    if data.get("agent_mode") == "full-access":
+        findings.append(
+            Finding(
+                rule="settings.approval-disabled",
+                severity="high",
+                title="Codex app runs local threads with full access",
+                detail=(
+                    "The app's permission mode for this machine is `full-access`: "
+                    "no sandbox and no approval prompts."
+                ),
+                mechanism=_APPROVAL_OFF
+                + " Without the sandbox, nothing limits what that command can "
+                "read, write, or send.",
+                location=settings.path,
+                remediation=(
+                    "Choose a sandboxed permission mode in the Codex app, and keep "
+                    "full access for disposable environments."
+                ),
+            )
+        )
+
+    risky = [a for a in data.get("automations") or [] if a.get("full_access")]
+    stopped = [a for a in risky if str(a.get("status")).upper() in _CODEX_STOPPED]
+    for automation in risky:
+        if automation in stopped:
+            continue
+        findings.append(
+            Finding(
+                rule="settings.approval-disabled",
+                severity="high",
+                title="Codex automation runs unattended with full access: %s"
+                % automation["name"],
+                detail=(
+                    "Status `%s`. The thread it runs in has `approvalPolicy: "
+                    "never` and a `dangerFullAccess` sandbox." % automation["status"]
+                ),
+                mechanism=(
+                    "A scheduled run has nobody watching. With no sandbox and no "
+                    "prompts, an instruction it picks up from a page, a file, or a "
+                    "tool result executes with your full access, on a timer."
+                ),
+                location=automation["path"],
+                remediation="Pause it, or run its thread in a sandboxed mode.",
+            )
+        )
+    if stopped:
+        findings.append(
+            Finding(
+                rule="settings.approval-disabled",
+                severity="info",
+                title="Paused Codex automations would run with full access",
+                detail="%d paused automation(s) — %s — target threads with no "
+                "sandbox and no approval prompts."
+                % (len(stopped), ", ".join(a["name"] for a in stopped[:5])),
+                mechanism=(
+                    "Nothing runs while they are paused. Resuming one starts an "
+                    "unattended agent with your full access."
+                ),
+                location=stopped[0]["path"],
+                remediation="Switch their threads to a sandboxed mode before resuming.",
+            )
+        )
     return findings
 
 

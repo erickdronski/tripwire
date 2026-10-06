@@ -267,18 +267,36 @@ class Hook:
 
 
 class SettingsFile:
-    __slots__ = ("agent", "data", "path", "scope")
+    """Permission configuration.
+
+    ``kind`` is ``settings`` for a config file the user edits, and
+    ``app-state`` for permissions an app stores on the user's behalf — the
+    Codex app keeps its permission mode there, not in ``config.toml``.
+    """
+
+    __slots__ = ("agent", "data", "kind", "path", "scope")
 
     def __init__(
-        self, path: str, data: Dict[str, Any], scope: str, agent: str = "claude-code"
+        self,
+        path: str,
+        data: Dict[str, Any],
+        scope: str,
+        agent: str = "claude-code",
+        kind: str = "settings",
     ) -> None:
         self.path = path
         self.data = data
         self.scope = scope
         self.agent = agent
+        self.kind = kind
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"path": self.path, "scope": self.scope, "agent": self.agent}
+        return {
+            "path": self.path,
+            "scope": self.scope,
+            "agent": self.agent,
+            "kind": self.kind,
+        }
 
 
 class Inventory:
@@ -1035,11 +1053,13 @@ def _desktop_config_paths(home: str, real_home: bool) -> List[str]:
 
 
 def _collect_codex(inventory: Inventory, codex_dir: str) -> None:
-    """``~/.codex/config.toml``: MCP servers, and the ``notify`` command.
+    """``~/.codex/config.toml``, and the Codex app's stored permissions.
 
-    ``notify`` is a program Codex runs after every agent turn — a hook in all
+    ``config.toml`` holds MCP servers, the approval and sandbox settings, and
+    ``notify`` — a program Codex runs after every agent turn, a hook in all
     but name, so it is inventoried as one and gets the same checks.
     """
+    _collect_codex_app_state(inventory, codex_dir)
     config = os.path.join(codex_dir, "config.toml")
     if not os.path.isfile(config):
         return
@@ -1065,6 +1085,83 @@ def _collect_codex(inventory: Inventory, codex_dir: str) -> None:
                 agent="codex",
             )
         )
+
+
+#: Where the Codex desktop app persists UI state, including the permission
+#: mode chosen for this machine and the saved permissions of the threads its
+#: scheduled automations run in. An internal format, so everything below is
+#: defensive: anything unrecognised is simply not reported.
+_CODEX_APP_STATE = ".codex-global-state.json"
+_CODEX_ATOMS = "electron-persisted-atom-state"
+_CODEX_LOCAL_MODE = "permission-selection-by-host-id:local"
+_CODEX_THREAD_PERMISSIONS = "heartbeat-thread-permissions-by-id"
+
+
+def _collect_codex_app_state(inventory: Inventory, codex_dir: str) -> None:
+    path = os.path.join(codex_dir, _CODEX_APP_STATE)
+    if not os.path.isfile(path):
+        return
+    inventory.agents.add("codex")
+    data = _read_json(path, inventory)
+    atoms = data.get(_CODEX_ATOMS) if data else None
+    if not isinstance(atoms, dict):
+        return
+
+    state: Dict[str, Any] = {}
+    selection = atoms.get(_CODEX_LOCAL_MODE)
+    if isinstance(selection, dict) and isinstance(selection.get("agentMode"), str):
+        state["agent_mode"] = selection["agentMode"]
+
+    threads = atoms.get(_CODEX_THREAD_PERMISSIONS)
+    full_access = set()
+    if isinstance(threads, dict):
+        for thread, permissions in threads.items():
+            if not isinstance(permissions, dict):
+                continue
+            sandbox = permissions.get("sandboxPolicy")
+            if isinstance(sandbox, dict):
+                sandbox = sandbox.get("type")
+            if permissions.get("approvalPolicy") == "never" and sandbox in (
+                "dangerFullAccess",
+                "danger-full-access",
+            ):
+                full_access.add(thread)
+
+    automations = []
+    for automation in _codex_automations(inventory, codex_dir):
+        automation["full_access"] = automation.get("thread") in full_access
+        automations.append(automation)
+    if automations:
+        state["automations"] = automations
+
+    if state:
+        inventory.settings.append(
+            SettingsFile(path, state, "user", agent="codex", kind="app-state")
+        )
+
+
+def _codex_automations(inventory: Inventory, codex_dir: str) -> List[Dict[str, Any]]:
+    """Scheduled Codex automations: name, status, and the thread they run in."""
+    directory = os.path.join(codex_dir, "automations")
+    if not os.path.isdir(directory):
+        return []
+    out = []
+    for entry in sorted(os.listdir(directory)):
+        path = os.path.join(directory, entry, "automation.toml")
+        if not os.path.isfile(path):
+            continue
+        data = _read_toml(path, inventory)
+        if not data or not isinstance(data.get("target_thread_id"), str):
+            continue
+        out.append(
+            {
+                "path": path,
+                "name": str(data.get("name") or entry),
+                "status": str(data.get("status") or "unknown"),
+                "thread": data["target_thread_id"],
+            }
+        )
+    return out
 
 
 def _absorb_servers(

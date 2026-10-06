@@ -41,11 +41,18 @@ python -m tripwire --info        # dogfood it
 
 Include the file that triggered it and what the tool said. If you can, note why
 the content is legitimate — that reasoning usually becomes the fix. Past false
-positives are pinned in `tests/test_rules.py::TestDoesNotCryWolf`; add yours
-there.
+positives are pinned in `tests/test_rules.py` — `TestDoesNotCryWolf`, and a
+`*Precision` class per rule that pairs each false positive with the attack it
+must still catch; add yours there. Paraphrase the text that triggered it rather
+than pasting someone else's skill.
 
 ## Supporting another agent
 
-`tripwire/inventory.py` reads Claude Code's layout. To support another harness,
-add collection that produces the same `Skill` / `Server` / `Hook` /
-`SettingsFile` objects. The rules and reporting layers are harness-agnostic.
+`tripwire/inventory.py` reads Claude Code, Claude Desktop, Cursor, and Codex.
+To support another harness, add collection that produces the same `Skill` /
+`Server` / `Hook` / `SettingsFile` objects, labelled with an `agent` and a
+`scope`, and resolve its default location under the `home` argument so tests
+can point it at a temporary directory. Tests must never read the real home
+directory. The rules and reporting layers are harness-agnostic, except where an
+agent spells "approval off" its own way — then add a check beside the others in
+`check_settings`.

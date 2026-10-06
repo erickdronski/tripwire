@@ -34,6 +34,20 @@ class TestEntryPoints(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("usage", (result.stdout + result.stderr).lower())
 
+    def test_reported_version_matches_the_package_metadata(self):
+        """A release bump has to land in both places, or `--version` lies."""
+        import os
+
+        from tripwire import __version__
+        from tripwire.tomlparse import loads
+
+        pyproject = os.path.join(os.path.dirname(__file__), os.pardir, "pyproject.toml")
+        with open(pyproject, encoding="utf-8") as handle:
+            declared = loads(handle.read())["project"]["version"]
+        self.assertEqual(__version__, declared)
+        result = self.run_module("--version")
+        self.assertIn(declared, result.stdout + result.stderr)
+
     def test_no_warnings_on_import(self):
         """A SyntaxWarning from an invalid escape would surface here."""
         result = subprocess.run(

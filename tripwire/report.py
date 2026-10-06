@@ -14,7 +14,7 @@ import os
 from typing import Dict, List, Optional, Sequence
 
 from .baseline import IGNORE_FILE
-from .inventory import Inventory
+from .inventory import AGENTS, Inventory
 from .rules import SEVERITIES, Finding, summarize_capabilities
 
 __all__ = ["render_json", "render_text"]
@@ -39,6 +39,11 @@ def render_text(
     lines.append("  tripwire — what your agent can currently do")
     lines.append(rule)
     lines.append("")
+    if caps["agents"]:
+        lines.append(
+            "  %-34s %s"
+            % ("agents found", ", ".join(AGENTS.get(a, a) for a in caps["agents"]))
+        )
     lines.append("  %-34s %d" % ("skills installed", caps["skills_total"]))
     lines.append(
         "  %-34s %d" % ("  from outside this machine", caps["skills_third_party"])
@@ -61,9 +66,17 @@ def render_text(
         )
     lines.append("  %-34s %d" % ("MCP servers configured", caps["servers_total"]))
     lines.append("  %-34s %d" % ("  reached over the network", caps["servers_remote"]))
+    if len(caps["servers_by_agent"]) > 1:
+        lines.append("  %-34s %s" % ("  by agent", _by_agent(caps["servers_by_agent"])))
+    if caps["servers_disabled"]:
+        lines.append(
+            "  %-34s %d" % ("  switched off (not counted)", caps["servers_disabled"])
+        )
     lines.append("  %-34s %d" % ("automatic hooks", caps["hooks_total"]))
     if caps["hook_events"]:
         lines.append("  %-34s %s" % ("  firing on", ", ".join(caps["hook_events"])))
+    if len(caps["hooks_by_agent"]) > 1:
+        lines.append("  %-34s %s" % ("  by agent", _by_agent(caps["hooks_by_agent"])))
     lines.append("  %-34s %d" % ("settings files", caps["settings_files"]))
     if caps["unreadable"]:
         lines.append("  %-34s %d" % ("unreadable files (skipped)", caps["unreadable"]))
@@ -116,11 +129,11 @@ def render_text(
         lines.append(
             "  %s %s%s" % (_MARK.get(finding.severity, " ·"), prefix, finding.title)
         )
-        lines.append("     %s" % finding.detail)
+        lines.append("     %s" % _shorten_home(finding.detail))
         if finding.mechanism:
             lines.append("     Why it matters: %s" % finding.mechanism)
         if finding.evidence:
-            lines.append("     > %s" % finding.evidence)
+            lines.append("     > %s" % _shorten_home(finding.evidence))
         lines.append("     %s" % _short_path(finding.location))
         copies = len(getattr(finding, "locations", ()) or ())
         if copies > 1:
@@ -178,6 +191,10 @@ def render_json(
         },
         indent=2,
     )
+
+
+def _by_agent(counts: Dict[str, int]) -> str:
+    return " · ".join("%s %d" % (AGENTS.get(a, a), n) for a, n in counts.items())
 
 
 def _short_path(path: str) -> str:

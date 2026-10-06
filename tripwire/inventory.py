@@ -5,10 +5,12 @@ it. Skills, MCP servers, hooks, and permission settings accumulate across
 months from marketplaces, plugin installs, per-project config, and one-off
 experiments — and no surface anywhere shows you the union of them.
 
-This module builds that union. It is read-only and offline: it opens files
-under the config directories and nothing else. No package is installed, no
-server is started, no network call is made, and nothing is executed — which
-matters, because half of what it inspects is designed to run commands.
+This module builds that union across the agents a machine is likely to
+have: Claude Code, Claude Desktop, Cursor, and Codex. It is read-only and
+offline: it opens files under their config directories and nothing else. No
+package is installed, no server is started, no network call is made, and
+nothing is executed — which matters, because half of what it inspects is
+designed to run commands.
 
 Four kinds of thing are inventoried:
 
@@ -39,9 +41,12 @@ import hashlib
 import json
 import os
 import re
+import shlex
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from .redact import redact
+from .tomlparse import TomlError
+from .tomlparse import loads as toml_loads
 
 __all__ = [
     "Hook",
@@ -58,8 +63,9 @@ class InventoryError(RuntimeError):
     """Raised when a config location cannot be read at all."""
 
 
-#: Config locations, in the order they are searched. Project-local files are
-#: added at scan time from the working directory.
+#: Claude Code's default locations. Every default — these and the other
+#: agents' — is resolved under the home directory, or under ``--home``.
+#: Project-local files are added at scan time from the working directory.
 USER_CONFIG_DIR = "~/.claude"
 USER_JSON = "~/.claude.json"
 
@@ -69,7 +75,29 @@ PROJECT_CONFIG_FILES = (
     ".mcp.json",
 )
 
+#: Claude Desktop keeps its config in the platform's application-data
+#: directory. All three are checked relative to the home directory, so a
+#: fixture home works on any platform; the environment variables that move
+#: them are honoured when auditing the real home.
+DESKTOP_CONFIG_PATHS = (
+    "Library/Application Support/Claude/claude_desktop_config.json",  # macOS
+    ".config/Claude/claude_desktop_config.json",  # Linux
+    "AppData/Roaming/Claude/claude_desktop_config.json",  # Windows
+)
+
+#: Agent identifiers, as they appear in JSON output, and as they are shown.
+AGENTS = {
+    "claude-code": "Claude Code",
+    "claude-desktop": "Claude Desktop",
+    "cursor": "Cursor",
+    "codex": "Codex",
+}
+
+#: Cap for skill text. Anything longer is not a skill anyone wrote by hand.
 MAX_READ_BYTES = 400_000
+#: Cap for JSON and TOML config. `~/.claude.json` grows with every project
+#: opened, and truncating it would make its servers silently disappear.
+MAX_CONFIG_BYTES = 16_000_000
 
 
 class Skill:
@@ -123,7 +151,19 @@ class Skill:
 
 
 class Server:
-    __slots__ = ("args", "command", "env", "name", "raw", "scope", "source", "url")
+    __slots__ = (
+        "agent",
+        "args",
+        "command",
+        "command_line",
+        "env",
+        "headers",
+        "name",
+        "scope",
+        "secret_on_command_line",
+        "source",
+        "url",
+    )
 
     def __init__(
         self,
@@ -133,37 +173,63 @@ class Server:
         args: Sequence[str],
         env: Dict[str, str],
         url: Optional[str],
-        raw: Dict[str, Any],
         scope: str = "user",
+        agent: str = "claude-code",
+        headers: Optional[Dict[str, str]] = None,
     ) -> None:
         self.name = name
         self.source = source
-        self.command = command
-        self.args = list(args)
-        self.env = dict(env)
-        self.url = url
-        self.raw = raw
         self.scope = scope
+        self.agent = agent
+        # The command line and URL are redacted at capture, like hook
+        # commands: they reach the report through finding evidence and the
+        # inventory dump. Whether redaction changed anything is kept, because
+        # a token pasted into `args` is itself a plaintext credential.
+        parts = [command or "", *args]
+        raw_line = url or " ".join(part for part in parts if part).strip()
+        self.command_line = redact(raw_line)
+        self.secret_on_command_line = self.command_line != raw_line
+        self.command = redact(command) if command else command
+        self.args = [redact(arg) for arg in args]
+        self.url = redact(url) if url else url
+        # Values are kept for the literal-credential check and never emitted:
+        # `to_dict` lists names only.
+        self.env = dict(env)
+        self.headers = dict(headers or {})
 
     @property
-    def command_line(self) -> str:
-        if self.url:
-            return self.url
-        parts = [self.command or "", *self.args]
-        return " ".join(part for part in parts if part).strip()
+    def label(self) -> str:
+        """Which agent loads this server, and from where."""
+        scope = self.scope
+        if scope.startswith("plugin:"):
+            scope = "plugin %s" % scope[len("plugin:") :]
+        else:
+            scope = "%s scope" % scope
+        return "%s, %s" % (AGENTS.get(self.agent, self.agent), scope)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
+            "agent": self.agent,
             "source": self.source,
             "scope": self.scope,
             "command_line": self.command_line,
             "env_keys": sorted(self.env),
+            "header_keys": sorted(self.headers),
         }
 
 
 class Hook:
-    __slots__ = ("command", "event", "kind", "matcher", "source", "timeout")
+    __slots__ = (
+        "agent",
+        "command",
+        "event",
+        "kind",
+        "matcher",
+        "scope",
+        "source",
+        "timeout",
+    )
 
     def __init__(
         self,
@@ -173,7 +239,11 @@ class Hook:
         source: str,
         timeout: Optional[int] = None,
         kind: str = "command",
+        agent: str = "claude-code",
+        scope: str = "user",
     ) -> None:
+        self.agent = agent
+        self.scope = scope
         self.event = event
         self.matcher = matcher
         # Redact at capture, not at render. A hook command reaches the report
@@ -186,6 +256,8 @@ class Hook:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "agent": self.agent,
+            "scope": self.scope,
             "event": self.event,
             "matcher": self.matcher,
             "command": self.command,
@@ -195,15 +267,18 @@ class Hook:
 
 
 class SettingsFile:
-    __slots__ = ("data", "path", "scope")
+    __slots__ = ("agent", "data", "path", "scope")
 
-    def __init__(self, path: str, data: Dict[str, Any], scope: str) -> None:
+    def __init__(
+        self, path: str, data: Dict[str, Any], scope: str, agent: str = "claude-code"
+    ) -> None:
         self.path = path
         self.data = data
         self.scope = scope
+        self.agent = agent
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"path": self.path, "scope": self.scope}
+        return {"path": self.path, "scope": self.scope, "agent": self.agent}
 
 
 class Inventory:
@@ -219,6 +294,10 @@ class Inventory:
         #: Things the reader should know about the scan itself — a config
         #: that could not be parsed, a layout that could not be interpreted.
         self.notes: List[str] = []
+        #: Agents whose configuration was found on this machine.
+        self.agents: Set[str] = set()
+        #: MCP servers configured but switched off (`disabled` / `enabled`).
+        self.servers_disabled = 0
         self._seen_files: Set[str] = set()
 
     def skip(self, reason: str, count: int) -> None:
@@ -231,6 +310,7 @@ class Inventory:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "agents": sorted(self.agents),
             "roots": self.roots,
             "skills": [s.to_dict() for s in self.skills],
             "servers": [s.to_dict() for s in self.servers],
@@ -249,16 +329,36 @@ def collect(
     config_dir: Optional[str] = None,
     project_dir: Optional[str] = None,
     user_json: Optional[str] = None,
+    home: Optional[str] = None,
 ) -> Inventory:
-    """Build the inventory. Never raises for a missing location."""
-    inventory = Inventory()
+    """Build the inventory. Never raises for a missing location.
 
-    base = os.path.expanduser(config_dir or USER_CONFIG_DIR)
+    With no arguments every agent's default location under the real home
+    directory is read. ``home`` moves all of those defaults under another
+    directory. Naming ``config_dir`` or ``user_json`` without ``home`` audits
+    just that Claude Code config — the other agents are skipped, and a note
+    in the report says so.
+    """
+    inventory = Inventory()
+    targeted = home is None and (config_dir is not None or user_json is not None)
+    home_dir = os.path.expanduser(home or "~")
+
+    base = (
+        os.path.expanduser(config_dir)
+        if config_dir
+        else os.path.join(home_dir, ".claude")
+    )
+    user_config = (
+        os.path.expanduser(user_json)
+        if user_json
+        else os.path.join(home_dir, ".claude.json")
+    )
     project = os.path.abspath(os.path.expanduser(project_dir)) if project_dir else None
 
     # Settings come first: `enabledPlugins` decides which plugins are loaded.
     if os.path.isdir(base):
         inventory.roots.append(base)
+        inventory.agents.add("claude-code")
         _collect_settings(inventory, os.path.join(base, "settings.json"), "user")
 
     if project:
@@ -267,6 +367,7 @@ def collect(
             if not os.path.isfile(path):
                 continue
             inventory.roots.append(path)
+            inventory.agents.add("claude-code")
             if relative.endswith(".mcp.json"):
                 _collect_mcp_file(inventory, path, scope="project")
             else:
@@ -276,9 +377,9 @@ def collect(
         _collect_user_skills(inventory, base)
         _collect_plugins(inventory, base, _enabled_plugins(inventory))
 
-    user_config = os.path.expanduser(user_json or USER_JSON)
     if os.path.isfile(user_config):
         inventory.roots.append(user_config)
+        inventory.agents.add("claude-code")
         _collect_user_json(inventory, user_config)
 
     if project:
@@ -287,14 +388,34 @@ def collect(
         project_skills = os.path.join(project, ".claude", "skills")
         if os.path.isdir(project_skills):
             _collect_skills(inventory, project_skills, source="project")
+        cursor = os.path.join(project, ".cursor", "mcp.json")
+        if os.path.isfile(cursor):
+            _collect_agent_mcp_file(inventory, cursor, "cursor", "project")
 
+    if targeted:
+        inventory.notes.append(
+            "Only the Claude Code config named on the command line was read. "
+            "Pass --home to also audit Claude Desktop, Cursor, and Codex."
+        )
+        return inventory
+
+    real_home = home is None
+    for path in _desktop_config_paths(home_dir, real_home):
+        _collect_agent_mcp_file(inventory, path, "claude-desktop", "user")
+    cursor = os.path.join(home_dir, ".cursor", "mcp.json")
+    if os.path.isfile(cursor):
+        _collect_agent_mcp_file(inventory, cursor, "cursor", "user")
+    codex_home = os.environ.get("CODEX_HOME") if real_home else None
+    _collect_codex(inventory, codex_home or os.path.join(home_dir, ".codex"))
     return inventory
 
 
-def _read(path: str, inventory: Inventory) -> Optional[str]:
+def _read(
+    path: str, inventory: Inventory, limit: int = MAX_READ_BYTES
+) -> Optional[str]:
     try:
         with open(path, "rb") as handle:
-            raw = handle.read(MAX_READ_BYTES)
+            raw = handle.read(limit)
         return raw.decode("utf-8", errors="replace")
     except OSError:
         inventory.unreadable.append(path)
@@ -302,15 +423,33 @@ def _read(path: str, inventory: Inventory) -> Optional[str]:
 
 
 def _read_json(path: str, inventory: Inventory) -> Optional[Dict[str, Any]]:
-    text = _read(path, inventory)
+    text = _read(path, inventory, MAX_CONFIG_BYTES)
     if text is None:
         return None
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        # Fail open, visibly: one malformed file degrades its own section of
+        # the report and says so, rather than aborting the run.
         inventory.unreadable.append(path)
+        inventory.notes.append("Could not parse %s (%s)." % (path, exc))
         return None
     return data if isinstance(data, dict) else None
+
+
+def _read_toml(path: str, inventory: Inventory) -> Optional[Dict[str, Any]]:
+    text = _read(path, inventory, MAX_CONFIG_BYTES)
+    if text is None:
+        return None
+    try:
+        return toml_loads(text)
+    except TomlError as exc:
+        inventory.unreadable.append(path)
+        inventory.notes.append(
+            "Could not parse %s (%s); its servers and settings are not in this "
+            "report." % (path, exc)
+        )
+        return None
 
 
 #: Never descended into while looking for skills: dependency trees, and every
@@ -472,8 +611,11 @@ def _collect_plugins(inventory: Inventory, base: str, enabled: Dict[str, bool]) 
     if os.path.isdir(trash):
         inventory.skip("deleted", _count_skill_files(trash))
 
+    for directory in legacy:
+        roots.extend(_find_plugin_roots(directory))
     for root, name in roots:
         _collect_plugin_root(inventory, root, name)
+    # Without a registry, skills outside any recognisable plugin still count.
     for directory in legacy:
         _collect_skills(inventory, directory)
 
@@ -585,13 +727,69 @@ def _live_synced_dirs(inventory: Inventory, directory: str) -> Optional[Dict[str
 
 
 def _collect_plugin_root(inventory: Inventory, root: str, name: str) -> None:
-    """Everything one loaded plugin contributes."""
-    manifest = os.path.join(root, ".claude-plugin", "plugin.json")
-    if os.path.isfile(manifest):
-        data = _read_json(manifest, inventory) or {}
-        if isinstance(data.get("name"), str) and data["name"]:
-            name = data["name"]
-    _collect_skills(inventory, root, source="plugin:%s" % name)
+    """Everything one loaded plugin contributes: skills, MCP servers, hooks.
+
+    Servers come from ``.mcp.json`` at the plugin root and hooks from
+    ``hooks/hooks.json``; the manifest can add more of either, inline or as
+    paths. Both locations are read and de-duplicated, since a manifest that
+    points at the default file must not count its servers twice.
+    """
+    manifest_path = os.path.join(root, ".claude-plugin", "plugin.json")
+    manifest: Dict[str, Any] = {}
+    if os.path.isfile(manifest_path):
+        manifest = _read_json(manifest_path, inventory) or {}
+        if isinstance(manifest.get("name"), str) and manifest["name"]:
+            name = manifest["name"]
+    scope = "plugin:%s" % name
+    _collect_skills(inventory, root, source=scope)
+
+    declared = manifest.get("mcpServers")
+    if isinstance(declared, dict):
+        _absorb_servers(inventory, declared, manifest_path, scope)
+    for path in _plugin_files(root, ".mcp.json", declared):
+        _collect_mcp_file(inventory, path, scope)
+
+    declared = manifest.get("hooks")
+    if isinstance(declared, dict):
+        inline = declared if "hooks" in declared else {"hooks": declared}
+        _collect_hooks(inventory, inline, manifest_path, scope=scope)
+    for path in _plugin_files(root, os.path.join("hooks", "hooks.json"), declared):
+        data = _read_json(path, inventory)
+        if data is not None:
+            _collect_hooks(inventory, data, path, scope=scope)
+
+
+def _plugin_files(root: str, default: str, declared: Any) -> List[str]:
+    """The default file plus any the manifest names, existing and unique."""
+    candidates = [default]
+    if isinstance(declared, str):
+        candidates.append(declared)
+    elif isinstance(declared, list):
+        candidates.extend(item for item in declared if isinstance(item, str))
+    out: List[str] = []
+    seen: Set[str] = set()
+    for candidate in candidates:
+        path = os.path.normpath(os.path.join(root, candidate))
+        real = os.path.realpath(path)
+        if real not in seen and os.path.isfile(path):
+            seen.add(real)
+            out.append(path)
+    return out
+
+
+def _find_plugin_roots(directory: str, depth: int = 4) -> List[Tuple[str, str]]:
+    """Directories with a plugin manifest, for layouts without a registry."""
+    roots: List[Tuple[str, str]] = []
+    for dirpath, dirnames, _filenames in os.walk(directory):
+        if os.path.isfile(os.path.join(dirpath, ".claude-plugin", "plugin.json")):
+            roots.append((dirpath, os.path.basename(dirpath)))
+            dirnames[:] = []
+            continue
+        if dirpath[len(directory) :].count(os.sep) >= depth:
+            dirnames[:] = []
+        else:
+            dirnames[:] = _prune(dirnames)
+    return roots
 
 
 def _posix(path: str) -> str:
@@ -712,14 +910,20 @@ def _collect_settings(inventory: Inventory, path: str, scope: str) -> None:
     if data is None:
         return
     inventory.settings.append(SettingsFile(path=path, data=data, scope=scope))
-    _collect_hooks(inventory, data, path)
+    _collect_hooks(inventory, data, path, scope=scope)
 
     servers = data.get("mcpServers")
     if isinstance(servers, dict):
         _absorb_servers(inventory, servers, path, scope)
 
 
-def _collect_hooks(inventory: Inventory, data: Dict[str, Any], source: str) -> None:
+def _collect_hooks(
+    inventory: Inventory,
+    data: Dict[str, Any],
+    source: str,
+    scope: str = "user",
+    agent: str = "claude-code",
+) -> None:
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
         return
@@ -748,6 +952,8 @@ def _collect_hooks(inventory: Inventory, data: Dict[str, Any], source: str) -> N
                         source=source,
                         timeout=timeout if isinstance(timeout, int) else None,
                         kind=str(definition.get("type") or "command"),
+                        agent=agent,
+                        scope=scope,
                     )
                 )
 
@@ -776,6 +982,7 @@ def _collect_user_json(inventory: Inventory, path: str) -> None:
 
 
 def _collect_mcp_file(inventory: Inventory, path: str, scope: str) -> None:
+    """A Claude Code ``.mcp.json``: servers under ``mcpServers``, or at the top."""
     data = _read_json(path, inventory)
     if data is None:
         return
@@ -784,25 +991,124 @@ def _collect_mcp_file(inventory: Inventory, path: str, scope: str) -> None:
         _absorb_servers(inventory, servers, path, scope)
 
 
+def _collect_agent_mcp_file(
+    inventory: Inventory, path: str, agent: str, scope: str
+) -> None:
+    """Claude Desktop and Cursor: servers only ever under ``mcpServers``.
+
+    Strict on purpose. Claude Desktop's file also holds preferences, and
+    reading the top level as servers would invent one called `preferences`.
+    """
+    inventory.roots.append(path)
+    inventory.agents.add(agent)
+    data = _read_json(path, inventory)
+    servers = data.get("mcpServers") if data else None
+    if isinstance(servers, dict):
+        _absorb_servers(inventory, servers, path, scope, agent=agent)
+
+
+def _desktop_config_paths(home: str, real_home: bool) -> List[str]:
+    candidates = [
+        os.path.join(home, *relative.split("/")) for relative in DESKTOP_CONFIG_PATHS
+    ]
+    if real_home:
+        for variable, relative in (
+            ("APPDATA", "Claude"),
+            ("XDG_CONFIG_HOME", "Claude"),
+        ):
+            value = os.environ.get(variable)
+            if value:
+                candidates.append(
+                    os.path.join(value, relative, "claude_desktop_config.json")
+                )
+    out: List[str] = []
+    seen: Set[str] = set()
+    for path in candidates:
+        real = os.path.realpath(path)
+        if real not in seen and os.path.isfile(path):
+            seen.add(real)
+            out.append(path)
+    return out
+
+
+# -- Codex -------------------------------------------------------------------
+
+
+def _collect_codex(inventory: Inventory, codex_dir: str) -> None:
+    """``~/.codex/config.toml``: MCP servers, and the ``notify`` command.
+
+    ``notify`` is a program Codex runs after every agent turn — a hook in all
+    but name, so it is inventoried as one and gets the same checks.
+    """
+    config = os.path.join(codex_dir, "config.toml")
+    if not os.path.isfile(config):
+        return
+    inventory.roots.append(config)
+    inventory.agents.add("codex")
+    data = _read_toml(config, inventory)
+    if data is None:
+        return
+    inventory.settings.append(
+        SettingsFile(path=config, data=data, scope="user", agent="codex")
+    )
+    servers = data.get("mcp_servers")
+    if isinstance(servers, dict):
+        _absorb_servers(inventory, servers, config, "user", agent="codex")
+    notify = data.get("notify")
+    if isinstance(notify, list) and notify and all(isinstance(p, str) for p in notify):
+        inventory.hooks.append(
+            Hook(
+                event="notify",
+                matcher=None,
+                command=" ".join(shlex.quote(part) for part in notify),
+                source=config,
+                agent="codex",
+            )
+        )
+
+
 def _absorb_servers(
-    inventory: Inventory, servers: Dict[str, Any], source: str, scope: str
+    inventory: Inventory,
+    servers: Dict[str, Any],
+    source: str,
+    scope: str,
+    agent: str = "claude-code",
 ) -> None:
     for name, config in servers.items():
         if not isinstance(config, dict):
             continue
+        command, url = config.get("command"), config.get("url")
+        # A flat `.mcp.json` puts servers at the top level next to anything
+        # else; an entry that neither launches nor connects is not a server.
+        if not isinstance(command, str) and not isinstance(url, str):
+            continue
+        if config.get("disabled") is True or config.get("enabled") is False:
+            inventory.servers_disabled += 1
+            continue
         env = config.get("env")
+        # `headers` (Claude Code, Cursor) and `http_headers` (Codex) carry
+        # static request headers — the usual home of a pasted API key.
+        headers: Dict[str, str] = {}
+        for key in ("headers", "http_headers"):
+            value = config.get(key)
+            if isinstance(value, dict):
+                headers.update({str(k): str(v) for k, v in value.items()})
+        if isinstance(config.get("bearer_token"), str):
+            headers["Authorization"] = "Bearer %s" % config["bearer_token"]
+        args = config.get("args")
         inventory.servers.append(
             Server(
                 name=str(name),
                 source=source,
-                command=config.get("command"),
-                args=[str(a) for a in (config.get("args") or [])],
+                command=command if isinstance(command, str) else None,
+                args=[str(a) for a in args] if isinstance(args, list) else [],
                 env={
                     str(k): str(v)
                     for k, v in (env.items() if isinstance(env, dict) else [])
                 },
-                url=config.get("url"),
-                raw=config,
+                url=url if isinstance(url, str) else None,
                 scope=scope,
+                agent=agent,
+                headers=headers,
             )
         )

@@ -3,6 +3,7 @@
     tripwire                  # audit this machine's agent configuration
     tripwire --info           # include the informational inventory
     tripwire --project .      # also read project-local config
+    tripwire --home DIR       # read every agent's config from under DIR
     tripwire --format json    # machine-readable
     tripwire --fail-on high   # exit non-zero for CI
 
@@ -38,7 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="tripwire",
         description=(
             "Audit the skills, MCP servers, hooks, and permissions installed "
-            "for your coding agent. Offline, read-only, nothing executed."
+            "for your coding agents — Claude Code, Claude Desktop, Cursor, and "
+            "Codex. Offline, read-only, nothing executed."
         ),
         epilog=(
             "tripwire never runs, installs, or fetches anything. It reads "
@@ -46,10 +48,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--config-dir", help="agent config directory (default: ~/.claude)"
+        "--home",
+        metavar="DIR",
+        help=(
+            "read every agent's config (Claude Code, Claude Desktop, Cursor, "
+            "Codex) from under DIR instead of your home directory"
+        ),
     )
     parser.add_argument(
-        "--user-json", help="user config file (default: ~/.claude.json)"
+        "--config-dir",
+        help=(
+            "Claude Code config directory (default: ~/.claude). Without "
+            "--home, only this Claude Code config is audited"
+        ),
+    )
+    parser.add_argument(
+        "--user-json", help="Claude Code user config file (default: ~/.claude.json)"
     )
     parser.add_argument(
         "--project",
@@ -114,12 +128,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         config_dir=args.config_dir,
         project_dir=args.project,
         user_json=args.user_json,
+        home=args.home,
     )
 
     if inventory.is_empty:
         sys.stderr.write(
-            "No agent configuration found. Looked in %s. Use --config-dir to "
-            "point somewhere else.\n" % (", ".join(inventory.roots) or "~/.claude")
+            "No agent configuration found. Looked in %s. Use --home or "
+            "--config-dir to point somewhere else.\n"
+            % (", ".join(inventory.roots) or "~/.claude")
         )
         return 2
 

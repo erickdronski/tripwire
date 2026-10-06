@@ -783,24 +783,54 @@ _SECRET_KEY_RE = re.compile(
 _REFERENCE_RE = re.compile(r"^\$\{?[A-Z_][A-Z0-9_]*\}?$|^\$\(|^<|^\{\{")
 
 _AUTO_INSTALL_RE = re.compile(r"\bnpx\b.*\s-{1,2}y(es)?\b|\buvx\b|\bpipx run\b")
+_PINNED_RE = re.compile(r"@\d+\.\d+|==\d")
+
+#: An auth scheme in front of a header value: `Bearer ${TOKEN}` is a
+#: reference, `Bearer sk-...` is not, and the scheme word decides neither.
+_AUTH_SCHEME_RE = re.compile(r"^(?:bearer|basic|token)\s+", re.IGNORECASE)
+
+
+def _literal_credentials(server) -> List[Tuple[str, str, str]]:
+    """(kind, name, value) for every secret-named entry holding a literal."""
+    found: List[Tuple[str, str, str]] = []
+    for kind, values in (
+        ("environment variable", server.env),
+        ("header", getattr(server, "headers", {}) or {}),
+    ):
+        for key, value in values.items():
+            if not _SECRET_KEY_RE.search(key):
+                continue
+            literal = _AUTH_SCHEME_RE.sub("", value.strip())
+            if _REFERENCE_RE.match(literal) or len(literal) < 8:
+                continue
+            found.append((kind, key, literal))
+    return found
 
 
 def check_servers(inventory: Inventory) -> List[Finding]:
     findings: List[Finding] = []
     for server in inventory.servers:
         command_line = server.command_line
+        label = server.label
+        # Identical servers in two copies of a plugin are one finding.
+        fingerprint = "%s|%s|%s|%s" % (
+            server.agent,
+            server.scope,
+            server.name,
+            command_line,
+        )
 
         if _AUTO_INSTALL_RE.search(command_line):
-            pinned = bool(re.search(r"@\d+\.\d+", command_line))
+            pinned = bool(_PINNED_RE.search(command_line))
             findings.append(
                 Finding(
                     rule="server.auto-install",
                     severity="low" if pinned else "medium",
                     title="Server installs its own code at launch: %s" % server.name,
                     detail=(
-                        "The command fetches and runs a package every time the "
-                        "server starts%s."
-                        % (", pinned to a version" if pinned else ", unpinned")
+                        "%s. The command fetches and runs a package every time "
+                        "the server starts%s."
+                        % (label, ", pinned to a version" if pinned else ", unpinned")
                     ),
                     mechanism=(
                         "An unpinned auto-installing command runs whatever the "
@@ -814,24 +844,19 @@ def check_servers(inventory: Inventory) -> List[Finding]:
                         "Pin the version, or install the package explicitly and "
                         "point the command at the installed binary."
                     ),
+                    fingerprint=fingerprint,
                 )
             )
 
-        for key, value in server.env.items():
-            if not _SECRET_KEY_RE.search(key):
-                continue
-            if _REFERENCE_RE.match(value.strip()):
-                continue
-            if len(value.strip()) < 8:
-                continue
+        for kind, key, value in _literal_credentials(server):
             findings.append(
                 Finding(
                     rule="server.literal-secret",
                     severity="high",
                     title="Credential stored in plaintext config: %s" % server.name,
                     detail=(
-                        "The environment variable %s holds a literal value rather "
-                        "than a reference." % key
+                        "%s. The %s %s holds a literal value rather than a "
+                        "reference." % (label, kind, key)
                     ),
                     mechanism=(
                         "Config files get committed, synced, backed up, and read "
@@ -842,8 +867,34 @@ def check_servers(inventory: Inventory) -> List[Finding]:
                     evidence="%s=%s" % (key, _redact(value)),
                     remediation=(
                         "Replace the value with an environment reference such as "
-                        "${%s} and set it in your shell." % key
+                        "${%s} and set it in your shell." % _env_name(key)
                     ),
+                    fingerprint=fingerprint,
+                )
+            )
+
+        if getattr(server, "secret_on_command_line", False):
+            findings.append(
+                Finding(
+                    rule="server.literal-secret",
+                    severity="high",
+                    title="Credential on a server's command line: %s" % server.name,
+                    detail=(
+                        "%s. The command line or URL contains a credential-shaped "
+                        "value, masked below." % label
+                    ),
+                    mechanism=(
+                        "A token in arguments or a URL is stored in plaintext in "
+                        "the config file, and is also visible to every process "
+                        "that can list command lines while the server runs."
+                    ),
+                    location=server.source,
+                    evidence=command_line[:160],
+                    remediation=(
+                        "Pass the credential through an environment reference "
+                        "instead of the command line."
+                    ),
+                    fingerprint=fingerprint,
                 )
             )
 
@@ -853,7 +904,7 @@ def check_servers(inventory: Inventory) -> List[Finding]:
                     rule="server.plaintext-transport",
                     severity="medium" if _is_local(server.url) else "high",
                     title="Server reached over unencrypted HTTP: %s" % server.name,
-                    detail="Configured URL is %s." % server.url,
+                    detail="%s. Configured URL is %s." % (label, server.url),
                     mechanism=(
                         "Tool calls and their results — including anything the "
                         "agent read from your filesystem — cross the network in "
@@ -861,9 +912,15 @@ def check_servers(inventory: Inventory) -> List[Finding]:
                     ),
                     location=server.source,
                     remediation="Use https, or bind the server to localhost.",
+                    fingerprint=fingerprint,
                 )
             )
     return findings
+
+
+def _env_name(key: str) -> str:
+    """A plausible environment variable name for a header or env key."""
+    return re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").upper() or "SECRET"
 
 
 def _is_local(url: str) -> bool:
@@ -900,10 +957,21 @@ def check_hooks(inventory: Inventory) -> List[Finding]:
         ]
 
         severity = "medium" if matched else "info"
-        detail = "Runs automatically on %s%s." % (
-            hook.event,
-            " for %s" % hook.matcher if hook.matcher and hook.matcher != "*" else "",
-        )
+        agent = getattr(hook, "agent", "claude-code")
+        scope = getattr(hook, "scope", "user")
+        if agent == "codex" and hook.event == "notify":
+            title = "Automatic command after every Codex turn"
+            detail = "Codex runs `notify` after each agent turn."
+        else:
+            title = "Automatic command on %s" % hook.event
+            detail = "Runs automatically on %s%s." % (
+                hook.event,
+                " for %s" % hook.matcher
+                if hook.matcher and hook.matcher != "*"
+                else "",
+            )
+        if scope.startswith("plugin:"):
+            detail += " Installed by plugin %s." % scope[len("plugin:") :]
         if matched:
             detail += " Command %s." % ", ".join(matched)
 
@@ -911,7 +979,7 @@ def check_hooks(inventory: Inventory) -> List[Finding]:
             Finding(
                 rule="hook.command",
                 severity=severity,
-                title="Automatic command on %s" % hook.event,
+                title=title,
                 detail=detail,
                 mechanism=(
                     "Hooks run without approval, on every matching event, with "
@@ -1038,14 +1106,26 @@ def summarize_capabilities(inventory: Inventory) -> Dict[str, Any]:
         "skills_with_scripts": len(skills_with_scripts),
         "skills_skipped": sum(inventory.skipped.values()),
         "skipped": dict(sorted(inventory.skipped.items())),
+        "agents": sorted(getattr(inventory, "agents", ())),
         "servers_total": len(inventory.servers),
         "servers_remote": len([s for s in inventory.servers if s.url]),
+        "servers_by_agent": _count_by_agent(inventory.servers),
+        "servers_disabled": getattr(inventory, "servers_disabled", 0),
         "hooks_total": len(inventory.hooks),
         "hook_events": sorted({h.event for h in inventory.hooks}),
+        "hooks_by_agent": _count_by_agent(inventory.hooks),
         "settings_files": len(inventory.settings),
         "unreadable": len(inventory.unreadable),
         "notes": list(inventory.notes),
     }
+
+
+def _count_by_agent(items) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in items:
+        agent = getattr(item, "agent", "claude-code")
+        counts[agent] = counts.get(agent, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def merge_copies(findings: List[Finding]) -> List[Finding]:

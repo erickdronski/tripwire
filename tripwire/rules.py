@@ -23,7 +23,7 @@ checks are string and structure inspection on files already on disk.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .inventory import Inventory
 from .redact import redact
@@ -95,8 +95,124 @@ class Finding:
 
 # -- injection surface ----------------------------------------------------
 
+#: Places credentials live. Naming one is not reading it — documentation says
+#: "store the key in `.env`" constantly — so this only ever contributes to a
+#: finding together with a read verb or a data-source construct below.
+_CREDENTIAL_STORE = (
+    r"(?:~|\$HOME|\$\{HOME\}|%USERPROFILE%)?[/\\]?\.aws[/\\]credentials\b"
+    r"|\.ssh[/\\](?:id_\w+|identity\b|[\w.-]*_key\b)?"
+    r"|\bid_(?:rsa|dsa|ecdsa|ed25519)\b"
+    r"|(?<![\w.])\.(?:netrc|npmrc|pypirc|git-credentials)\b"
+    r"|\.docker[/\\]config\.json\b|\.kube[/\\]config\b"
+    r"|(?<![\w./-])\.env(?:\.[\w-]+)?\b(?![\w-])"
+    r"|\bcredentials\.json\b|\.config[/\\]gcloud\b"
+    r"|\blogin\.keychain\b|/etc/shadow\b"
+)
+
+#: A verb that reads, copies, or ships a file, followed closely by a store.
+#: "Fabricated credentials" and "OAuth client credentials" match neither half.
+_CREDENTIAL_READ_RE = re.compile(
+    r"\b(?:cat|less|head|tail|read|reads|reading|open|opens|load|loads|dump|dumps|"
+    r"print|prints|copy|copies|cp|grab|grabs|collect|collects|extract|steal|"
+    r"exfiltrate|upload|uploads|send|sends|attach|base64|tar|zip|scp|rsync|"
+    r"encode|paste|parse|parses)\b[^\n.;]{0,40}?(?:" + _CREDENTIAL_STORE + r")",
+    re.IGNORECASE,
+)
+
+#: Every construct that counts as *accessing* a credential: reading a store,
+#: using one as a command's data source (`curl -d @~/.aws/credentials`,
+#: `nc host 80 < ~/.ssh/id_rsa`), dumping the environment or the keychain, or
+#: expanding a secret-named variable. The word "credentials" alone is none of
+#: these — that was the source of every false positive this rule ever had.
+_CREDENTIAL_ACCESS_RES = (
+    _CREDENTIAL_READ_RE,
+    re.compile(r"(?:@|<\s*)(?:" + _CREDENTIAL_STORE + r")", re.IGNORECASE),
+    re.compile(
+        r"\bprintenv\b|\benv\s*(?:\||>)"
+        r"|\bsecurity\s+(?:dump-keychain|find-(?:generic|internet)-password)"
+        r"|/proc/(?:self|\d+)/environ"
+        r"|(?:json\.dumps|dict|JSON\.stringify)\s*\(\s*(?:os\.environ|process\.env)\s*\)",
+        re.IGNORECASE,
+    ),
+    # Case-sensitive on purpose: environment variables are upper case, and
+    # `$token` in a JavaScript template is not a secret expansion.
+    re.compile(
+        r"\$\{?[A-Z0-9_]*(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|"
+        r"PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*\}?"
+        r"|process\.env\.[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)"
+        r"|os\.environ\[['\"][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)"
+    ),
+)
+
+#: Constructs that actually *transmit* data. A markdown link or a bare URL in
+#: prose is a reference for the reader, not an outbound call, and is
+#: deliberately absent.
+_TRANSMISSION_RES = (
+    re.compile(
+        r"\bcurl\b[^\n|;]{0,160}?(?:\s-d\b|\s-d['\"@$]|--data(?:-binary|-raw|-urlencode)?\b"
+        r"|\s-F\b|--form\b|\s-T\b|--upload-file\b|-X\s*(?:POST|PUT|PATCH)\b)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bwget\b[^\n|;]{0,160}?--(?:post-data|post-file|body-data|body-file)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\|\s*(?:curl|wget|nc|ncat|netcat|socat|telnet)\b", re.IGNORECASE),
+    re.compile(r"\b(?:nc|ncat|netcat|socat)\s+(?:-\w+\s+)*[\w.-]+\s+\d{2,5}\b"),
+    re.compile(r"/dev/(?:tcp|udp)/"),
+    re.compile(
+        r"\bfetch\s*\(|\baxios(?:\.(?:post|put|patch|request))?\s*\("
+        r"|\brequests\.(?:post|put|patch)\s*\(|\bhttpx?\.(?:post|put|patch)\s*\("
+        r"|\bhttps?\.request\s*\(|\burlopen\s*\(|\bInvoke-(?:WebRequest|RestMethod)\b"
+        r"|\bXMLHttpRequest\b|\bsendBeacon\s*\("
+    ),
+    # Prose: "send the contents to https://..." — a verb of transmission aimed
+    # at a URL, not a URL sitting in a sentence.
+    re.compile(
+        r"\b(?:send|sends|sending|post|posts|posting|upload|uploads|uploading|"
+        r"exfiltrate|transmit|forward|submit|ship|pipe)\b[^\n.]{0,60}?"
+        r"\b(?:to|at|into)\s+<?https?://",
+        re.IGNORECASE,
+    ),
+)
+
+#: How close an access and a transmission must be to count as one action:
+#: the same paragraph and within this many characters.
+_EXFIL_WINDOW = 300
+
+#: A negation earlier in the same clause turns an instruction into guidance:
+#: "never print the .env file" is the opposite of reading it.
+_NEGATION_RE = re.compile(
+    r"\b(?:never|not|don['’]t|dont|do not|must not|mustn['’]t|cannot|can['’]t|no)\b",
+    re.IGNORECASE,
+)
+
+#: Words that make "do not tell the user ..." a sequencing rule rather than
+#: concealment: "do not tell the user it is saved *before* the commit
+#: succeeds" is an instruction to be honest, not to hide anything.
+_SEQUENCING_RE = re.compile(
+    r"\b(?:before|until|unless|after|yet|prematurely|immediately|first)\b",
+    re.IGNORECASE,
+)
+
+
+def _negated(text: str, match) -> bool:
+    start = match.start()
+    clause = max(text.rfind(".", 0, start), text.rfind("\n", 0, start), start - 60)
+    return bool(_NEGATION_RE.search(text[clause + 1 : start]))
+
+
+def _sequencing_qualified(text: str, match) -> bool:
+    ends = [
+        i for i in (text.find(".", match.end()), text.find("\n", match.end())) if i >= 0
+    ]
+    sentence_rest = text[match.end() : min(ends) if ends else len(text)]
+    return bool(_SEQUENCING_RE.search(sentence_rest))
+
+
 #: Phrases that read as instructions aimed at a model rather than
-#: documentation aimed at a person, each with its own base severity.
+#: documentation aimed at a person, each with its own base severity and an
+#: optional exemption for the legitimate sentence that most resembles it.
 #:
 #: The severity split is the whole design. A skill that *documents* reading a
 #: `.env` file, or shows `rm -rf` inside a regex example, is doing its job —
@@ -104,62 +220,162 @@ class Finding:
 #: mute. High severity is reserved for constructions with no legitimate
 #: documentation use: overriding prior instructions, hiding activity from the
 #: user, or shipping data to a fixed endpoint.
+#:
+#: Concealment means hiding *activity*. Honesty rules — "do not tell the user
+#: it is saved before the commit succeeds", "never claim success without
+#: telling the user the results were empty" — tell the model to say *more*,
+#: and every one of them was once a high-severity false positive here. So the
+#: patterns require an object that is the model's own activity ("that you",
+#: "what you", "about this"), a hiding verb, or a hiding adverb; sequencing
+#: words exempt the sentence; and a bare "without telling the user" no longer
+#: matches at all, because in real skills it is almost always negated.
 _IMPERATIVE_PATTERNS = (
     (
         r"ignore (all |any )?(previous|prior|earlier|above) (instructions|prompts|rules)",
         "override of prior instructions",
         "high",
+        None,
     ),
     (
         r"disregard (all |any )?(previous|prior|the above) (instructions|prompts|rules)",
         "override of prior instructions",
         "high",
+        None,
     ),
     (
-        r"do not (tell|inform|mention to|reveal to) the user",
+        r"\b(?:do\s+not|don['’]t|never|must\s+not|should\s+not)\s+"
+        r"(?:tell|inform|notify|alert|let)\s+(?:the\s+)?users?(?:\s+know)?"
+        r"(?:\s+(?:that\s+you|what\s+you|about\s+(?:this|these|it|that|"
+        r"any\s+of\s+(?:this|it)|anything))\b|\s*(?=[.!;]|$))",
         "concealment from the user",
         "high",
+        _sequencing_qualified,
     ),
     (
-        r"without (telling|informing|notifying) the user",
+        r"\b(?:do\s+not|don['’]t|never)\s+(?:mention|reveal|disclose|admit)\s+"
+        r"(?:this|these|it|that\s+you\b[^.\n]{0,60}?|what\s+you\b[^.\n]{0,60}?|anything)"
+        r"\s+to\s+the\s+users?\b",
         "concealment from the user",
         "high",
+        _sequencing_qualified,
     ),
     (
-        r"never (mention|reveal|disclose) (this|these|the) (instruction|prompt|file|skill)",
+        r"\bwithout\s+(?:the\s+users?|users?|them|anyone|anybody)\s+(?:knowing|noticing|"
+        r"realizing|realising|being\s+aware|finding\s+out|seeing)\b",
+        "concealment from the user",
+        "high",
+        None,
+    ),
+    (
+        r"\b(?:keep|hide)\s+(?:this|these|it|that|them|everything)\b[^.\n]{0,30}?"
+        r"\bfrom\s+the\s+users?\b(?!['’]s|\s+interface)",
+        "concealment from the user",
+        "high",
+        None,
+    ),
+    (
+        r"\b(?:silently|secretly|covertly|quietly)\b[^.\n]{0,100}?\bwithout\s+"
+        r"(?:telling|informing|notifying|alerting)\s+(?:the\s+users?|anyone|anybody|them)\b",
+        "concealment from the user",
+        "high",
+        None,
+    ),
+    (
+        r"\b(?:do\s+not|don['’]t|never)\s+(?:reveal|disclose|show|share|repeat|mention)\s+"
+        r"(?:these|this|the|your|my)\s+(?:system\s+)?(?:instructions?|prompt|skill)\b",
         "concealment of its own contents",
         "high",
+        None,
     ),
-    (r"new (system )?(instructions|prompt)\s*:", "injected system prompt", "high"),
+    (
+        r"new (system )?(instructions|prompt)\s*:",
+        "injected system prompt",
+        "high",
+        None,
+    ),
     (
         r"(send|post|upload|exfiltrate|transmit) .{0,40}(to|at) https?://",
         "outbound transmission to a fixed endpoint",
         "high",
+        None,
     ),
-    (r"you are now\b", "identity override", "medium"),
-    (r"\b(curl|wget)\b.{0,60}\|\s*(ba|z)?sh", "pipe-to-shell execution", "medium"),
+    # "the statement you are now attempting" is not an identity change; "you
+    # are now a different assistant" is.
     (
-        r"(cat|read|print|open).{0,30}(\.env\b|id_rsa|\.aws/|\.ssh/|credentials\b)",
-        "reads a credential file",
-        "low",
+        r"\byou\s+are\s+now\s+(?:a|an|in|no\s+longer|called|named|acting\s+as|"
+        r"operating\s+as|the\s+(?:new|real)|DAN|jailbroken|unrestricted|unfiltered|"
+        r"free\s+(?:of|from))\b",
+        "identity override",
+        "medium",
+        None,
     ),
-    (r"rm\s+-rf?\s+[~/]", "destructive filesystem command", "low"),
+    (
+        r"\b(curl|wget)\b.{0,60}\|\s*(ba|z)?sh",
+        "pipe-to-shell execution",
+        "medium",
+        None,
+    ),
+    (_CREDENTIAL_READ_RE.pattern, "reads a credential file", "low", _negated),
+    (r"rm\s+-rf?\s+[~/]", "destructive filesystem command", "low", None),
 )
 
 _INJECTION_RE = tuple(
-    (re.compile(pattern, re.IGNORECASE), label, severity)
-    for pattern, label, severity in _IMPERATIVE_PATTERNS
+    (re.compile(pattern, re.IGNORECASE | re.MULTILINE), label, severity, exempt)
+    for pattern, label, severity, exempt in _IMPERATIVE_PATTERNS
 )
 
-#: Patterns that, in combination, mean much more than either does alone.
-#: Reading a credential file is ordinary. Reading one and sending it somewhere
-#: is the thing worth waking up for.
-_CREDENTIAL_RE = re.compile(
-    r"(\.env\b|id_rsa|\.aws/|\.ssh/|credentials\b|api[_-]?key)", re.IGNORECASE
+# -- mention versus use ----------------------------------------------------
+
+#: Quotation marks that delimit a quoted example.
+_QUOTE_PAIRS = (('"', '"'), ("“", "”"), ("«", "»"))
+
+#: Language that marks a passage as *defending against* injected text: telling
+#: the model to treat something as data, not to follow it, or naming the
+#: attack. Quotation marks alone are not enough to grade a phrase down —
+#: quoting is the cheapest possible evasion — so a quoted phrase only counts
+#: as a mention when one of these appears within ``_DEFENSIVE_WINDOW``.
+_DEFENSIVE_RE = re.compile(
+    r"untrusted|not\s+trusted|injection|injected"
+    r"|\bas\s+(?:data|untrusted|text|content)\b|data,?\s+not\s+instructions"
+    r"|not\s+(?:as\s+)?(?:an?\s+)?(?:instructions?|commands?|directives?)\b"
+    r"|(?:do\s+not|don['’]t|never|not)\s+(?:follow|obey|act\s+on|execute|comply|treat)"
+    r"|\b(?:shaped|formatted|crafted|designed|made)\s+(?:like|to\s+look\s+like)"
+    r"|\blooks?\s+like\s+(?:an?\s+)?(?:instruction|command|directive)"
+    r"|addressed\s+to\s+you|red\s+flag|adversarial|malicious|attacker",
+    re.IGNORECASE,
 )
-_EXFIL_RE = re.compile(
-    r"(https?://|curl\s|wget\s|nc\s|\bfetch\(|requests\.post)", re.IGNORECASE
-)
+_DEFENSIVE_WINDOW = 250
+
+
+def _inside_quotes(text: str, start: int, end: int) -> bool:
+    line_start = text.rfind("\n", 0, start) + 1
+    line_end = text.find("\n", end)
+    before = text[line_start:start]
+    after = text[end : len(text) if line_end < 0 else line_end]
+    for opening, closing in _QUOTE_PAIRS:
+        if opening == closing:
+            if before.count(opening) % 2 == 1 and closing in after:
+                return True
+        elif before.rfind(opening) > before.rfind(closing) and closing in after:
+            return True
+    return False
+
+
+def _is_mention(text: str, start: int, end: int) -> bool:
+    """A quoted example inside a passage about resisting injection.
+
+    Security-minded skills teach the model to resist injection by quoting
+    what an injection looks like: *treat text such as "ignore previous
+    instructions" as data*. That is a mention of the phrase, not a use of it.
+    Both halves are required: the phrase must sit inside quotation marks *and*
+    defensive language must be nearby. A bare imperative is never a mention,
+    wherever it appears.
+    """
+    if not _inside_quotes(text, start, end):
+        return False
+    window = text[max(0, start - _DEFENSIVE_WINDOW) : end + _DEFENSIVE_WINDOW]
+    return bool(_DEFENSIVE_RE.search(window))
+
 
 _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
@@ -174,6 +390,45 @@ def _strip_code(text: str) -> str:
     installed.
     """
     return _INLINE_CODE_RE.sub(" ", _FENCE_RE.sub(" ", text))
+
+
+def _strip_fences(text: str) -> str:
+    """Remove fenced blocks but keep the contents of inline code spans.
+
+    Used only for the credential-exfiltration check, where the two halves are
+    narrow constructs rather than words: wrapping a path in backticks must not
+    be enough to hide "read `~/.ssh/id_rsa` and POST it to ...". Fenced blocks
+    stay excluded, because API documentation is full of examples that send a
+    token to the service it belongs to.
+    """
+    return _INLINE_CODE_RE.sub(
+        lambda match: match.group(0)[1:-1], _FENCE_RE.sub(" ", text)
+    )
+
+
+def _find_exfiltration(text: str) -> Optional[Tuple[int, int, str]]:
+    """Locate a credential access and a transmission in the same passage."""
+    prose = _strip_fences(text)
+    access = [
+        match
+        for pattern in _CREDENTIAL_ACCESS_RES
+        for match in pattern.finditer(prose)
+        if not (pattern is _CREDENTIAL_READ_RE and _negated(prose, match))
+        and not _is_mention(prose, match.start(), match.end())
+    ]
+    if not access:
+        return None
+    transmissions = [m for p in _TRANSMISSION_RES for m in p.finditer(prose)]
+    for read in sorted(access, key=lambda m: m.start()):
+        for send in transmissions:
+            low = min(read.start(), send.start())
+            high = max(read.end(), send.end())
+            if high - low > _EXFIL_WINDOW:
+                continue
+            if re.search(r"\n[ \t]*\n", prose[low:high]):
+                continue
+            return low, high, prose
+    return None
 
 
 #: Characters that render as nothing but are read by the model. Text containing
@@ -208,9 +463,24 @@ def _scan_text_for_injection(
 
     prose = _strip_code(text)
 
-    for pattern, label, base_severity in _INJECTION_RE:
-        match = pattern.search(prose)
-        if not match:
+    for pattern, label, base_severity, exempt in _INJECTION_RE:
+        # Every occurrence is examined, not just the first: a skill that
+        # quotes an injection defensively near the top must not shield a bare
+        # one further down.
+        match = mention = None
+        for candidate in pattern.finditer(prose):
+            if exempt is not None and exempt(prose, candidate):
+                continue
+            if _is_mention(prose, candidate.start(), candidate.end()):
+                mention = mention or candidate
+                continue
+            match = candidate
+            break
+        if match is None:
+            if mention is not None:
+                findings.append(
+                    _quoted_example(prose, mention, label, location, rule_prefix)
+                )
             continue
 
         severity = base_severity
@@ -257,36 +527,35 @@ def _scan_text_for_injection(
 
     # Credential access is unremarkable on its own and serious next to an
     # outbound call. Only the combination is escalated — and it is escalated
-    # regardless of where the file lives, for the reason above.
-    if True:
-        credential = _CREDENTIAL_RE.search(prose)
-        if credential:
-            window = prose[max(0, credential.start() - 400) : credential.end() + 400]
-            exfil = _EXFIL_RE.search(window)
-            if exfil:
-                findings.append(
-                    Finding(
-                        rule="%s.credential-exfiltration" % rule_prefix,
-                        severity="high",
-                        title="Credential access near an outbound call",
-                        detail=(
-                            "Text referencing a credential file appears within a "
-                            "few lines of a network call."
-                        ),
-                        mechanism=(
-                            "Reading a credential is ordinary setup. Reading one "
-                            "and sending it somewhere is the shape of "
-                            "exfiltration, and the two appearing together is "
-                            "worth reading before you trust the skill."
-                        ),
-                        location=location,
-                        evidence=_excerpt(prose, credential.start(), credential.end()),
-                        remediation=(
-                            "Read the whole section. Confirm the network call is "
-                            "to the service the credential belongs to."
-                        ),
-                    )
-                )
+    # regardless of where the file lives, for the reason above. Both halves
+    # are constructs, not vocabulary: the word "credentials" beside a docs
+    # link is neither a read nor a transmission.
+    exfiltration = _find_exfiltration(text)
+    if exfiltration is not None:
+        low, high, passage = exfiltration
+        findings.append(
+            Finding(
+                rule="%s.credential-exfiltration" % rule_prefix,
+                severity="high",
+                title="Credential access near an outbound call",
+                detail=(
+                    "A passage reads a credential store or secret and, in the "
+                    "same paragraph, transmits data over the network."
+                ),
+                mechanism=(
+                    "Reading a credential is ordinary setup. Reading one "
+                    "and sending it somewhere is the shape of "
+                    "exfiltration, and the two appearing together is "
+                    "worth reading before you trust the skill."
+                ),
+                location=location,
+                evidence=_excerpt(passage, low, high, window=40),
+                remediation=(
+                    "Read the whole section. Confirm the network call is "
+                    "to the service the credential belongs to."
+                ),
+            )
+        )
 
     invisible = _find_invisible(text)
     if invisible:
@@ -310,6 +579,35 @@ def _scan_text_for_injection(
             )
         )
     return findings
+
+
+def _quoted_example(
+    prose: str, match, label: str, location: str, rule_prefix: str
+) -> Finding:
+    """Informational record of a phrase quoted as an example of injection.
+
+    Kept rather than dropped so the evasion it could represent stays visible
+    under ``--info``: quoting is the cheapest way to dress an instruction up
+    as an example, and the reader should be able to check the surrounding
+    text really is defensive.
+    """
+    return Finding(
+        rule="%s.imperative" % rule_prefix,
+        severity="info",
+        title="Quoted injection example: %s" % label,
+        detail=(
+            "The phrase appears in quotation marks next to text telling the "
+            "model to treat such content as data — a warning about injection, "
+            "not an injection."
+        ),
+        mechanism=(
+            "Skills that handle untrusted input teach the model what an "
+            "injection looks like by quoting one. Listed so you can confirm "
+            "the surrounding text really is defensive."
+        ),
+        location=location,
+        evidence=_excerpt(prose, match.start(), match.end()),
+    )
 
 
 def _find_invisible(text: str) -> List[tuple]:

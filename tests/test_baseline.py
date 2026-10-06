@@ -104,6 +104,17 @@ class TestIgnores(unittest.TestCase):
         self.assertEqual(len(kept), 1)
         self.assertEqual(len(suppressed), 1)
 
+    def test_a_copy_outside_the_reviewed_path_keeps_the_finding(self):
+        """Merged copies are suppressed only when every copy was reviewed."""
+        ignores = load_ignores(self.write("hook.command  plugins/mine\n"))
+        reviewed = finding(location="/x/plugins/mine/a")
+        reviewed.locations.append("/x/plugins/mine/b")
+        partly = finding(location="/x/plugins/mine/a")
+        partly.locations.append("/x/plugins/theirs/a")
+        kept, suppressed = apply_ignores([reviewed, partly], ignores)
+        self.assertEqual(kept, [partly])
+        self.assertEqual(suppressed, [reviewed])
+
     def test_reason_is_captured_for_the_report(self):
         path = self.write("hook.command  *  reviewed: this is my own hook\n")
         _kept, suppressed = apply_ignores([finding()], load_ignores(path))

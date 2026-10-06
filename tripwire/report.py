@@ -10,6 +10,7 @@ severity first, each with the mechanism attached — a scanner that says
 from __future__ import annotations
 
 import json
+import os
 from typing import Dict, List, Optional, Sequence
 
 from .baseline import IGNORE_FILE
@@ -45,6 +46,19 @@ def render_text(
     lines.append(
         "  %-34s %d" % ("  shipping executable code", caps["skills_with_scripts"])
     )
+    if caps["skills_distinct"] != caps["skills_total"]:
+        lines.append("  %-34s %d" % ("  distinct by content", caps["skills_distinct"]))
+    if caps["skills_skipped"]:
+        # Deleted, never installed, or superseded. Shown so a lower count
+        # than the files on disk is explained rather than suspicious.
+        lines.append(
+            "  %-34s %d  (%s)"
+            % (
+                "  on disk but not loaded",
+                caps["skills_skipped"],
+                ", ".join("%d %s" % (n, why) for why, n in caps["skipped"].items()),
+            )
+        )
     lines.append("  %-34s %d" % ("MCP servers configured", caps["servers_total"]))
     lines.append("  %-34s %d" % ("  reached over the network", caps["servers_remote"]))
     lines.append("  %-34s %d" % ("automatic hooks", caps["hooks_total"]))
@@ -53,6 +67,8 @@ def render_text(
     lines.append("  %-34s %d" % ("settings files", caps["settings_files"]))
     if caps["unreadable"]:
         lines.append("  %-34s %d" % ("unreadable files (skipped)", caps["unreadable"]))
+    for note in caps["notes"]:
+        lines.append("  note: %s" % _shorten_home(note))
     lines.append("")
 
     counts = dict.fromkeys(SEVERITIES, 0)
@@ -106,6 +122,11 @@ def render_text(
         if finding.evidence:
             lines.append("     > %s" % finding.evidence)
         lines.append("     %s" % _short_path(finding.location))
+        copies = len(getattr(finding, "locations", ()) or ())
+        if copies > 1:
+            lines.append(
+                "     (%d copies — every path is listed in --format json)" % copies
+            )
         if finding.remediation:
             lines.append("     → %s" % finding.remediation)
         lines.append("")
@@ -160,7 +181,11 @@ def render_json(
 
 
 def _short_path(path: str) -> str:
-    import os
-
     home = os.path.expanduser("~")
     return path.replace(home, "~") if path.startswith(home) else path
+
+
+def _shorten_home(text: str) -> str:
+    """Shorten the home directory wherever it appears inside a sentence."""
+    home = os.path.expanduser("~")
+    return text.replace(home + os.sep, "~" + os.sep) if home else text

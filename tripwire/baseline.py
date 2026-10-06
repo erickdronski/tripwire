@@ -99,7 +99,10 @@ class Ignore:
             return False
         if not self.pattern:
             return True
-        return self.pattern in _normalize_location(finding.location)
+        # A finding with several copies is suppressed only when every copy is
+        # under the reviewed path. A copy somewhere else was not reviewed.
+        locations = getattr(finding, "locations", None) or [finding.location]
+        return all(self.pattern in _normalize_location(loc) for loc in locations)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return "Ignore(%r, %r)" % (self.rule, self.pattern)

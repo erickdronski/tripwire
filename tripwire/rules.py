@@ -23,12 +23,12 @@ checks are string and structure inspection on files already on disk.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .inventory import Inventory
 from .redact import redact
 
-__all__ = ["SEVERITIES", "Finding", "run_all"]
+__all__ = ["SEVERITIES", "Finding", "merge_copies", "run_all"]
 
 SEVERITIES = ("high", "medium", "low", "info")
 
@@ -37,7 +37,14 @@ class Finding:
     __slots__ = (
         "detail",
         "evidence",
+        # What makes two findings without evidence the same finding — the
+        # content digest of the skill or server they describe.
+        "fingerprint",
         "location",
+        # Every place this exact finding occurs. The same skill is often on
+        # disk several times (installed, synced, re-synced); reporting it once
+        # per copy buries everything else.
+        "locations",
         "mechanism",
         "remediation",
         "rule",
@@ -58,6 +65,7 @@ class Finding:
         mechanism: Optional[str] = None,
         evidence: Optional[str] = None,
         remediation: Optional[str] = None,
+        fingerprint: Optional[str] = None,
     ) -> None:
         self.rule = rule
         self.severity = severity
@@ -65,6 +73,8 @@ class Finding:
         self.detail = detail
         self.mechanism = mechanism
         self.location = location
+        self.locations = [location]
+        self.fingerprint = fingerprint
         # Redact centrally rather than at each call site: a rule author who
         # forgets would turn an audit report into a credential leak.
         self.evidence = redact(evidence) if evidence else evidence
@@ -83,6 +93,8 @@ class Finding:
             value = getattr(self, key)
             if value:
                 payload[key] = value
+        payload["copies"] = len(self.locations)
+        payload["locations"] = list(self.locations)
         return payload
 
     @property
@@ -98,26 +110,72 @@ class Finding:
 #: Places credentials live. Naming one is not reading it — documentation says
 #: "store the key in `.env`" constantly — so this only ever contributes to a
 #: finding together with a read verb or a data-source construct below.
+#:
+#: Every alternative starts with a literal character, and word-boundary
+#: checks sit *after* it as lookbehinds (``i(?<!\wi)d_`` is ``\bid_``). That
+#: lets the regex engine skip straight to candidate characters instead of
+#: trying every alternative at every position, which halves the cost of the
+#: most frequently run pattern in the scanner.
 _CREDENTIAL_STORE = (
-    r"(?:~|\$HOME|\$\{HOME\}|%USERPROFILE%)?[/\\]?\.aws[/\\]credentials\b"
+    r"\.aws[/\\]credentials\b"
     r"|\.ssh[/\\](?:id_\w+|identity\b|[\w.-]*_key\b)?"
-    r"|\bid_(?:rsa|dsa|ecdsa|ed25519)\b"
-    r"|(?<![\w.])\.(?:netrc|npmrc|pypirc|git-credentials)\b"
+    r"|\.(?<![\w.]\.)(?:netrc|npmrc|pypirc|git-credentials)\b"
     r"|\.docker[/\\]config\.json\b|\.kube[/\\]config\b"
-    r"|(?<![\w./-])\.env(?:\.[\w-]+)?\b(?![\w-])"
-    r"|\bcredentials\.json\b|\.config[/\\]gcloud\b"
-    r"|\blogin\.keychain\b|/etc/shadow\b"
+    r"|\.(?<![\w./-]\.)env(?:\.[\w-]+)?\b(?![\w-])"
+    r"|\.config[/\\]gcloud\b"
+    r"|i(?<!\wi)d_(?:rsa|dsa|ecdsa|ed25519)\b"
+    r"|c(?<!\wc)redentials\.json\b"
+    r"|l(?<!\wl)ogin\.keychain\b"
+    r"|/etc/shadow\b"
 )
+_CREDENTIAL_STORE_RE = re.compile(_CREDENTIAL_STORE, re.IGNORECASE)
 
-#: A verb that reads, copies, or ships a file, followed closely by a store.
-#: "Fabricated credentials" and "OAuth client credentials" match neither half.
-_CREDENTIAL_READ_RE = re.compile(
+#: A verb that reads, copies, or ships a file, ending just before a store.
+_READ_VERB_BEFORE_RE = re.compile(
     r"\b(?:cat|less|head|tail|read|reads|reading|open|opens|load|loads|dump|dumps|"
     r"print|prints|copy|copies|cp|grab|grabs|collect|collects|extract|steal|"
     r"exfiltrate|upload|uploads|send|sends|attach|base64|tar|zip|scp|rsync|"
-    r"encode|paste|parse|parses)\b[^\n.;]{0,40}?(?:" + _CREDENTIAL_STORE + r")",
+    r"encode|paste|parse|parses)\b[^\n.;]{0,40}$",
     re.IGNORECASE,
 )
+
+
+class _Span:
+    """The part of ``re.Match`` the scanners use, for matches built by hand."""
+
+    __slots__ = ("_end", "_start", "_text")
+
+    def __init__(self, text: str, start: int, end: int) -> None:
+        self._text, self._start, self._end = text, start, end
+
+    def start(self) -> int:
+        return self._start
+
+    def end(self) -> int:
+        return self._end
+
+    def group(self, _index: int = 0) -> str:
+        return self._text[self._start : self._end]
+
+
+class _CredentialReads:
+    """``<read verb> ... <credential store>`` — "cat ~/.aws/credentials".
+
+    Matched store-first: a store is a rare, distinctive token, while the verb
+    list is common English, and trying the verbs at every position of ~7 MB
+    of skills was the single slowest thing in a run. "Fabricated
+    credentials" and "OAuth client credentials" match neither half.
+    """
+
+    def finditer(self, text: str) -> Iterator[_Span]:
+        for store in _CREDENTIAL_STORE_RE.finditer(text):
+            begin = max(0, store.start() - 48)
+            verb = _READ_VERB_BEFORE_RE.search(text, begin, store.start())
+            if verb:
+                yield _Span(text, verb.start(), store.end())
+
+
+_CREDENTIAL_READ_RE = _CredentialReads()
 
 #: Every construct that counts as *accessing* a credential: reading a store,
 #: using one as a command's data source (`curl -d @~/.aws/credentials`,
@@ -126,10 +184,11 @@ _CREDENTIAL_READ_RE = re.compile(
 #: these — that was the source of every false positive this rule ever had.
 _CREDENTIAL_ACCESS_RES = (
     _CREDENTIAL_READ_RE,
-    re.compile(r"(?:@|<\s*)(?:" + _CREDENTIAL_STORE + r")", re.IGNORECASE),
+    # A store used as a command's input: `-d @~/.aws/credentials`, `< .env`.
+    re.compile(r"[@<]\s*[^\s'\"]{0,60}?(?:" + _CREDENTIAL_STORE + r")", re.IGNORECASE),
     re.compile(
-        r"\bprintenv\b|\benv\s*(?:\||>)"
-        r"|\bsecurity\s+(?:dump-keychain|find-(?:generic|internet)-password)"
+        r"\b(?:printenv\b|env\s*[|>]"
+        r"|security\s+(?:dump-keychain|find-(?:generic|internet)-password))"
         r"|/proc/(?:self|\d+)/environ"
         r"|(?:json\.dumps|dict|JSON\.stringify)\s*\(\s*(?:os\.environ|process\.env)\s*\)",
         re.IGNORECASE,
@@ -315,12 +374,19 @@ _IMPERATIVE_PATTERNS = (
         "medium",
         None,
     ),
-    (_CREDENTIAL_READ_RE.pattern, "reads a credential file", "low", _negated),
+    (_CREDENTIAL_READ_RE, "reads a credential file", "low", _negated),
     (r"rm\s+-rf?\s+[~/]", "destructive filesystem command", "low", None),
 )
 
 _INJECTION_RE = tuple(
-    (re.compile(pattern, re.IGNORECASE | re.MULTILINE), label, severity, exempt)
+    (
+        re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+        if isinstance(pattern, str)
+        else pattern,
+        label,
+        severity,
+        exempt,
+    )
     for pattern, label, severity, exempt in _IMPERATIVE_PATTERNS
 )
 
@@ -455,7 +521,11 @@ _TAG_RANGE = (0xE0000, 0xE007F)
 
 
 def _scan_text_for_injection(
-    text: str, location: str, rule_prefix: str, trusted: bool
+    text: str,
+    location: str,
+    rule_prefix: str,
+    trusted: bool,
+    fingerprint: Optional[str] = None,
 ) -> List[Finding]:
     findings: List[Finding] = []
     if not text:
@@ -576,6 +646,7 @@ def _scan_text_for_injection(
                 ),
                 location=location,
                 remediation="Strip the characters, or remove the content entirely.",
+                fingerprint=fingerprint,
             )
         )
     return findings
@@ -610,14 +681,16 @@ def _quoted_example(
     )
 
 
+_INVISIBLE_RE = re.compile(
+    "[%s\\U%08x-\\U%08x]" % ("".join(_INVISIBLE), _TAG_RANGE[0], _TAG_RANGE[1])
+)
+
+
 def _find_invisible(text: str) -> List[tuple]:
-    found: List[tuple] = []
-    for index, char in enumerate(text):
-        if char in _INVISIBLE:
-            found.append((index, _INVISIBLE[char]))
-        elif _TAG_RANGE[0] <= ord(char) <= _TAG_RANGE[1]:
-            found.append((index, "Unicode tag character"))
-    return found
+    return [
+        (match.start(), _INVISIBLE.get(match.group(0), "Unicode tag character"))
+        for match in _INVISIBLE_RE.finditer(text)
+    ]
 
 
 def _excerpt(text: str, start: int, end: int, window: int = 60) -> str:
@@ -633,13 +706,23 @@ def _excerpt(text: str, start: int, end: int, window: int = 60) -> str:
 
 # -- skills ---------------------------------------------------------------
 
+#: Sources written on this machine. Everything else — plugins, marketplaces,
+#: skills synced from an account — came from somewhere else.
+_LOCAL_SOURCES = ("user", "project", "scheduled-task")
+
 
 def check_skills(inventory: Inventory) -> List[Finding]:
     findings: List[Finding] = []
     for skill in inventory.skills:
-        trusted = skill.source in ("user", "project")
+        trusted = skill.source in _LOCAL_SOURCES
         findings.extend(
-            _scan_text_for_injection(skill.text, skill.path, "skill", trusted=trusted)
+            _scan_text_for_injection(
+                skill.text,
+                skill.path,
+                "skill",
+                trusted=trusted,
+                fingerprint=skill.digest,
+            )
         )
 
         if skill.scripts:
@@ -665,6 +748,7 @@ def check_skills(inventory: Inventory) -> List[Finding]:
                         if not trusted
                         else "No action — you wrote these."
                     ),
+                    fingerprint=skill.digest,
                 )
             )
 
@@ -680,6 +764,7 @@ def check_skills(inventory: Inventory) -> List[Finding]:
                     ),
                     location=skill.path,
                     remediation="Add a description, or remove the skill.",
+                    fingerprint=skill.digest,
                 )
             )
     return findings
@@ -943,22 +1028,47 @@ def summarize_capabilities(inventory: Inventory) -> Dict[str, Any]:
     This is the part people actually act on. Not a list of problems — a plain
     statement of reach.
     """
-    third_party_skills = [
-        s for s in inventory.skills if s.source not in ("user", "project")
-    ]
+    third_party_skills = [s for s in inventory.skills if s.source not in _LOCAL_SOURCES]
     skills_with_scripts = [s for s in inventory.skills if s.scripts]
 
     return {
         "skills_total": len(inventory.skills),
+        "skills_distinct": len({s.digest for s in inventory.skills}),
         "skills_third_party": len(third_party_skills),
         "skills_with_scripts": len(skills_with_scripts),
+        "skills_skipped": sum(inventory.skipped.values()),
+        "skipped": dict(sorted(inventory.skipped.items())),
         "servers_total": len(inventory.servers),
         "servers_remote": len([s for s in inventory.servers if s.url]),
         "hooks_total": len(inventory.hooks),
         "hook_events": sorted({h.event for h in inventory.hooks}),
         "settings_files": len(inventory.settings),
         "unreadable": len(inventory.unreadable),
+        "notes": list(inventory.notes),
     }
+
+
+def merge_copies(findings: List[Finding]) -> List[Finding]:
+    """Report each distinct finding once, with every location it occurs in.
+
+    Two findings are the same when rule, severity, title, and detail match
+    and so does the evidence — or, for findings without evidence, the
+    fingerprint of the content they describe. Findings with neither stay
+    separate: two settings files that both disable approval are two
+    decisions, not two copies of one.
+    """
+    merged: Dict[tuple, Finding] = {}
+    out: List[Finding] = []
+    for finding in findings:
+        identity = finding.evidence or finding.fingerprint or finding.location
+        key = (finding.rule, finding.severity, finding.title, finding.detail, identity)
+        first = merged.get(key)
+        if first is None:
+            merged[key] = finding
+            out.append(finding)
+        elif finding.location not in first.locations:
+            first.locations.append(finding.location)
+    return out
 
 
 def run_all(inventory: Inventory) -> List[Finding]:
@@ -967,5 +1077,7 @@ def run_all(inventory: Inventory) -> List[Finding]:
     findings.extend(check_servers(inventory))
     findings.extend(check_skills(inventory))
     findings.extend(check_hooks(inventory))
+    # Sorting first makes the reported location of a merged finding stable:
+    # always the first path in order, not whichever copy was walked first.
     findings.sort(key=lambda f: (f.rank, f.rule, f.location))
-    return findings
+    return merge_copies(findings)

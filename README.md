@@ -360,7 +360,7 @@ right now?*
 ## Testing
 
 ```bash
-python -m unittest discover -s tests -t .   # 196 tests
+python -m unittest discover -s tests -t .   # 204 tests
 ```
 
 ## Related

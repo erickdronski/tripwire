@@ -1,6 +1,6 @@
 <h1 align="center">tripwire</h1>
 
-<p align="center"><strong>See what your coding agent is actually allowed to do.</strong><br>
+<p align="center"><strong>Review the configuration and permissions behind your coding agents.</strong><br>
 An offline audit of the skills, MCP servers, hooks, and permissions installed on your machine —<br>
 across Claude Code, Claude Desktop, Cursor, and Codex.</p>
 
@@ -19,20 +19,30 @@ across Claude Code, Claude Desktop, Cursor, and Codex.</p>
   <img alt="Python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-174ea6">
   <img alt="Linux macOS Windows" src="https://img.shields.io/badge/tested_on-Linux%20%7C%20macOS%20%7C%20Windows-0f766e">
   <img alt="ruff" src="https://img.shields.io/badge/lint-ruff-d97706">
-  <img alt="196 tests" src="https://img.shields.io/badge/tests-196-6b21a8">
+  <a href="https://github.com/erickdronski/tripwire/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/erickdronski/tripwire/actions/workflows/ci.yml/badge.svg"></a>
 </p>
 
 ---
 
-You installed a plugin two months ago. You added an MCP server from a README.
-You wrote a hook once and forgot about it. You tried a second agent, and a third.
-Somewhere in there is a setting that turned approval prompts off "just for this
-one task."
+`tripwire` inventories local agent configuration and flags patterns that deserve
+review: risky permissions, literal credentials, unpinned launch commands, and
+potentially unsafe instructions. It gives developers and teams a common view of
+configured capabilities across supported agents.
 
-Nothing shows you the union of that. `tripwire` builds it, then flags the
-specific ways it can be turned against you.
+| Capability | Practical use |
+|---|---|
+| Capability inventory | Review configured skills, MCP servers, hooks, and permissions |
+| Evidence-based findings | Inspect the file, mechanism, and severity behind each flag |
+| Baselines and suppressions | Track new findings and preserve reviewed exceptions |
+| CI integration | Fail a check at a chosen severity, with JSON available for automation |
+
+The audit reads local files without executing plugins or contacting servers.
+It covers supported configuration sources, not every runtime capability; a
+clean report is not proof that an agent or plugin is safe.
 
 ## Try it
+
+Requirements: Python 3.9+ and Git for installation from source.
 
 ```bash
 pip install git+https://github.com/erickdronski/tripwire
@@ -96,14 +106,12 @@ which matters, because much of what it inspects exists to run commands.
 | **Hooks** | Every automatic command — from settings, from plugins, and Codex's `notify` — escalated when it pipes to a shell, deletes recursively, elevates, or opens a socket |
 | **Permissions** | Approval or the sandbox switched off: Claude Code's `dangerouslySkipPermissions` and `bypassPermissions` mode, Codex's `approval_policy` and `sandbox_mode` per profile, the Codex app's full-access mode and the automations that run in it; wildcard allow-entries; allow-lists that have grown past review |
 
-Two findings are worth calling out because they are the ones that catch real
-attacks rather than sloppiness.
+Two checks illustrate how findings are derived from specific mechanisms.
 
 **Invisible characters in model-visible text.** Zero-width spaces, bidirectional
-overrides, and Unicode tag characters render as nothing to you and read normally
-to the model. A file containing them is, by construction, saying something to
-the model that it is not saying to you. There is no legitimate reason for them
-in a skill.
+overrides, and Unicode tag characters can make model-visible text difficult
+to inspect. Their presence is flagged for review; a finding alone does not
+establish malicious intent.
 
 **Credential access next to an outbound call.** Reading a `.env` file is
 ordinary setup. Reading one *and* sending it somewhere is the shape of
@@ -149,10 +157,10 @@ A scanner whose high-severity findings are mostly false positives gets muted —
 and then its true findings are invisible too. So the severity model is the
 design, not an afterthought.
 
-**High severity is reserved for constructions with no legitimate documentation
-use**: overriding prior instructions, hiding activity from the user, shipping
-data to a fixed endpoint, invisible characters, plaintext credentials, approval
-switched off. Everything else grades down.
+**High severity identifies patterns that warrant prompt review**: overriding
+prior instructions, hiding activity from the user, transmitting credential data,
+invisible characters, plaintext credentials, and disabled approval controls.
+The finding is a review signal, not a determination of intent.
 
 The first version of this tool reported **four high-severity findings on a clean
 machine. Three were false positives** — official skills that *documented*
@@ -165,8 +173,8 @@ writing a `.env` file, or showed `rm -rf` inside a regex example. Three fixes:
 - **Local paths are not proof of authorship.** Skills land in `~/.claude/skills`
   via install scripts, package managers, and other agents — so the trust
   discount applies only to signals that local authorship genuinely explains.
-  "Ignore all previous instructions" stays high wherever the file lives, because
-  there is no version of that sentence you meant to write.
+  A bare "ignore all previous instructions" remains high regardless of its path;
+  defensive quotations receive separate handling described below.
 
 Every one of those cases is now a test. Roughly half the suite asserts that
 something is *not* flagged, and CI plants a malicious config on every run — a
@@ -281,8 +289,7 @@ tripwire --baseline --fail-on high   # breaks the build only on something new
 
 ## What it does not do
 
-Being honest about this is the difference between a useful tool and security
-theater.
+Interpret findings within these boundaries:
 
 - **It does not prove anything is safe.** It is a static read of local config
   against a finite pattern set. A clean report means nothing obviously wrong was
@@ -354,7 +361,7 @@ Part of a set of small, standalone tools for working with coding agents:
 |---|---|
 | [agentsmith](https://github.com/erickdronski/agentsmith) | Derives your AGENTS.md from the repo and detects drift |
 | [contexttest](https://github.com/erickdronski/contexttest) | A/B tests whether an AGENTS.md change actually helps |
-| [burnrate](https://github.com/erickdronski/burnrate) | Prices what your agent sessions cost, with a hard spend cap |
+| [burnrate](https://github.com/erickdronski/burnrate) | Estimates session costs and provides a Claude Code budget guard |
 | [gtm-skills](https://github.com/erickdronski/gtm-skills) | Go-to-market skills for agents, on a tested arithmetic engine |
 
 ## License

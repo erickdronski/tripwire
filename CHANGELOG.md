@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Match ignore paths on component boundaries, so reviewing `plugins/mine` no
+  longer suppresses findings under `plugins/mine-unreviewed`. Preserve trailing
+  slash and Windows separator support.
+- Save every location of a merged finding in baselines. A new copy is now new
+  and can fail the CI threshold; legacy baselines accept only the one location
+  they recorded until the extra copies are reviewed.
+- Reject malformed baseline entries with a readable error and avoid normalizing
+  directories that merely begin with the current home directory's name.
+
 ## [0.2.0] — 2026-10-06
 
 Measured against a real workstation (~940 skill files, Claude Desktop, Codex):

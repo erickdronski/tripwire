@@ -256,6 +256,11 @@ settings.wildcard-allow   *             reviewed: this box is a disposable conta
 skill.bundled-scripts     plugins/mine  I wrote these
 ```
 
+Paths match whole path components: `plugins/mine` covers that directory and
+its descendants, but not `plugins/mine-unreviewed`. Every location of a merged
+finding must match for it to be suppressed. Trailing slashes and Windows path
+separators are accepted.
+
 **`--baseline`** — answers the question security work actually turns on: *what
 changed?*
 
@@ -264,6 +269,11 @@ tripwire --update-baseline      # record today's findings as reviewed
 tripwire --baseline             # later: mark anything absent from it as NEW
 tripwire --baseline --new-only  # just the new ones
 ```
+
+The baseline records every location of a merged finding. Adding a copy at a
+new path makes the finding new again. Older baselines recorded only the primary
+location; additional copies are new until reviewed and saved with
+`--update-baseline`. Malformed baseline entries produce a readable error.
 
 ```
   1 high · 1 medium · 0 low · 1 informational

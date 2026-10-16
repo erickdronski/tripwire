@@ -76,7 +76,7 @@ def _normalize_location(location: str) -> str:
     """
     text = (location or "").replace(os.sep, "/").replace("\\", "/")
     home = os.path.expanduser("~").replace(os.sep, "/")
-    if home and text.startswith(home):
+    if home and (text == home or text.startswith(home + "/")):
         text = "~" + text[len(home) :]
     # Temp directories carry a random component; collapse it so fixtures and
     # CI runs produce stable keys.
@@ -102,7 +102,11 @@ class Ignore:
         # A finding with several copies is suppressed only when every copy is
         # under the reviewed path. A copy somewhere else was not reviewed.
         locations = getattr(finding, "locations", None) or [finding.location]
-        return all(self.pattern in _normalize_location(loc) for loc in locations)
+        pattern = _normalize_location(self.pattern).rstrip("/")
+        # Match whole path components, not similarly named neighboring paths.
+        prefix = "^" if pattern.startswith(("/", "~")) else r"(?:^|/)"
+        expression = prefix + re.escape(pattern) + r"(?:/|$)"
+        return all(re.search(expression, _normalize_location(loc)) for loc in locations)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return "Ignore(%r, %r)" % (self.rule, self.pattern)
@@ -175,10 +179,22 @@ def load_baseline(path: str) -> Dict[str, Any]:
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise BaselineError("could not read baseline %s: %s" % (path, exc)) from exc
     if not isinstance(data, dict):
         raise BaselineError("%s is not a tripwire baseline" % path)
+    entries = data.get("findings", [])
+    if not isinstance(entries, list):
+        raise BaselineError("%s baseline findings must be a list" % path)
+    for item in entries:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("key"), str)
+            or not isinstance(item.get("location"), str)
+            or not isinstance(item.get("locations", []), list)
+            or any(not isinstance(loc, str) for loc in item.get("locations", []))
+        ):
+            raise BaselineError("%s contains a malformed baseline finding" % path)
     return data
 
 
@@ -200,6 +216,7 @@ def write_baseline(path: str, findings: Sequence, version: str) -> int:
                     "severity": f.severity,
                     "title": f.title,
                     "location": _normalize_location(f.location),
+                    "locations": sorted(_locations(f)),
                 }
                 for f in findings
             }.values(),
@@ -214,14 +231,18 @@ def write_baseline(path: str, findings: Sequence, version: str) -> int:
 
 def diff_against_baseline(findings: Sequence, baseline: Dict[str, Any]):
     """Split findings into (new, known), and list baseline entries now absent."""
-    known_keys = {
-        item.get("key")
+    known_entries = {
+        item.get("key"): item
         for item in baseline.get("findings", [])
         if isinstance(item, dict)
     }
     new, known = [], []
     for finding in findings:
-        (known if finding_key(finding) in known_keys else new).append(finding)
+        entry = known_entries.get(finding_key(finding))
+        reviewed = (
+            set(entry.get("locations", [entry.get("location", "")])) if entry else set()
+        )
+        (known if entry and _locations(finding) <= reviewed else new).append(finding)
 
     present = {finding_key(f) for f in findings}
     resolved = [
@@ -230,3 +251,10 @@ def diff_against_baseline(findings: Sequence, baseline: Dict[str, Any]):
         if isinstance(item, dict) and item.get("key") not in present
     ]
     return new, known, resolved
+
+
+def _locations(finding) -> set:
+    return {
+        _normalize_location(location)
+        for location in (getattr(finding, "locations", None) or [finding.location])
+    }
